@@ -1,0 +1,12 @@
+[
+  { "name": "idle-1", "frames": 8, "delay": 250 },
+  { "name": "idle-2", "frames": 5, "delay": 250 },
+  { "name": "idle-3", "frames": 5, "delay": 200 },
+  { "name": "idle-4", "frames": 6, "delay": 250 },
+  { "name": "idle-5", "frames": 5, "delay": 170 },
+  { "name": "idle-6", "frames": 4, "delay": 250 },
+  { "name": "idle-7", "frames": 5, "delay": 200 },
+  { "name": "idle-8", "frames": 8, "delay": 250 },
+  { "name": "read", "frames": 7, "delay": 250 },
+  { "name": "shop", "frames": 8, "delay": 200 }
+]

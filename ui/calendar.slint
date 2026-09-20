@@ -1,0 +1,303 @@
+// 日历月视图:6 周 × 7 天的网格 + 选中那天的任务列表。
+// 数据(42 个格子、选中日列表、月份文案)都由 Rust 算好推过来,这里只画。
+//
+// 格子高度不写死:外层按可用高度均分,内容再按格子高度决定详略 ——
+// 格子小就只报任务数量,够大才列标题。这样窗口缩放时不会因为文字长短变形。
+
+import { ScrollView } from "std-widgets.slint";
+import {
+    AppData, DayCell, PanelEdge, Logic, Theme, TodoCheck, TimeBadge, IconButton, TextButton, VCenter,
+} from "widgets.slint";
+
+component DayCellView inherits Rectangle {
+    in property <DayCell> cell;
+    /// 格子小 / 窗口矮的时候只报任务数量,不列标题。
+    /// 由外层按窗口高度算好传进来 —— 不能读 self.height,那会和布局互为因果。
+    in property <bool> compact: false;
+
+    callback clicked();
+
+    // 关键:格子的宽高都不能跟着内容走。GridLayout 的行高/列宽都是按内容算的 ——
+    // 只给 stretch 没用(那只能分配多出来的空间),有长标题的那格会把整行/整列撑得
+    // 比别的大,日历就参差不齐。写死 preferred-* 之后 7 列 6 行一样大,
+    // 窗口变大再按 stretch 均分。
+    preferred-width: 56px;
+    preferred-height: 58px;
+    min-width: 20px;
+    min-height: 26px;
+    clip: true;
+
+    border-radius: 6px * Theme.radius-scale;
+    border-width: 1px;
+    // 玻璃下每个格子都要一条发丝边 —— 网格靠它才立得住:底色是花的时候,
+    // 没有边界的半透明块会互相串色,看不出是一格一格的。
+    // 原主题恢复成无边框,跟改造前完全一致。
+    border-color: cell.is-selected ? Theme.accent-ink
+        : (Theme.glass ? Theme.border : transparent);
+    // 休息日底色压暗一档,一眼能看出哪几天不上班
+    background: cell.is-selected ? Theme.accent-soft
+        : (touch.has-hover ? Theme.hover : (cell.rest ? Theme.inset : Theme.card));
+
+    animate background { duration: 120ms; }
+
+    VerticalLayout {
+        padding: 2px;
+        spacing: 1px;
+
+        HorizontalLayout {
+            height: 18px;
+
+            // 今天:日期数字加主题色圆底
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                border-radius: 9px * Theme.radius-scale;
+                background: cell.is-today ? Theme.accent : transparent;
+
+                Text {
+                    text: "\{cell.day}";
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    color: cell.is-today ? Theme.accent-fg
+                        : (cell.in-month ? Theme.text : Theme.text-dim.with-alpha(0.5));
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            // 格子太小时,只用一个数字表示这天有几件事
+            if compact && cell.count > 0 : Rectangle {
+                width: 15px;
+                height: 15px;
+                border-radius: 8px * Theme.radius-scale;
+                background: cell.overdue ? Theme.danger : Theme.accent;
+
+                Text {
+                    text: "\{cell.count}";
+                    font-size: 9px;
+                    color: Theme.accent-fg;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // 有空间列标题时,数量用小红点 + 「+N」表示
+            if !compact : VCenter {
+                if cell.overdue : Rectangle {
+                    width: 5px;
+                    height: 5px;
+                    border-radius: 3px;
+                    background: Theme.danger;
+                }
+            }
+            if !compact && cell.more > 0 : Text {
+                text: "+\{cell.more}";
+                font-size: 9px;
+                color: Theme.text-dim;
+                vertical-alignment: center;
+            }
+        }
+
+        // 节日或农历
+        if !compact && !cell.sub.is-empty : Text {
+            text: cell.sub;
+            font-size: 11px;
+            wrap: no-wrap;
+            overflow: elide;
+            color: cell.is-work ? Theme.text-dim
+                : (cell.is-festival ? Theme.danger : Theme.text-dim);
+        }
+
+        if !compact && cell.line1 != "" : Text {
+            text: cell.line1;
+            font-size: 11px;
+            wrap: no-wrap;
+            overflow: elide;
+            color: cell.line1-done ? Theme.text-dim : Theme.text;
+        }
+        if !compact && cell.line2 != "" : Text {
+            text: cell.line2;
+            font-size: 11px;
+            wrap: no-wrap;
+            overflow: elide;
+            color: cell.line2-done ? Theme.text-dim : Theme.text;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component DayTaskRow inherits HorizontalLayout {
+    in property <int> task-id;
+    in property <string> title;
+    in property <bool> done;
+    in property <string> badge;
+    in property <bool> overdue;
+
+    height: 28px;
+    spacing: 8px;
+
+    TodoCheck {
+        width: 18px;
+        height: 18px;
+        checked: root.done;
+        toggled => { Logic.toggle-day-task(root.task-id); }
+    }
+
+    Text {
+        text: root.title;
+        font-size: 13px;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+        wrap: no-wrap;
+        overflow: elide;
+        color: root.done ? Theme.text-dim : Theme.text;
+    }
+
+    VCenter {
+        if root.badge != "" : TimeBadge {
+            text: root.badge;
+            overdue: root.overdue;
+        }
+    }
+}
+
+export component CalendarView inherits Rectangle {
+    background: transparent;
+
+    /// 窗口矮的时候:格子只显示数量,省下的空间全给下面的任务列表
+    in property <bool> compact: false;
+
+    property <[string]> weekdays: ["一", "二", "三", "四", "五", "六", "日"];
+
+    VerticalLayout {
+        spacing: 6px;
+
+        HorizontalLayout {
+            spacing: 6px;
+
+            month-prev := IconButton {
+                icon: @image-url("icons/chevron-left.svg");
+                icon-size: 15px;
+                clicked => { Logic.shift-month(-1); }
+            }
+            Text {
+                text: AppData.month-label;
+                font-size: 15px;
+                font-weight: 600;
+                color: Theme.text;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+                horizontal-stretch: 1;
+            }
+            month-next := IconButton {
+                icon: @image-url("icons/chevron-right.svg");
+                icon-size: 15px;
+                clicked => { Logic.shift-month(1); }
+            }
+            goto-today := TextButton {
+                label: "今天";
+                clicked => { Logic.goto-today(); }
+            }
+        }
+
+        HorizontalLayout {
+            for name in root.weekdays : Text {
+                text: name;
+                font-size: 11px;
+                color: Theme.text-dim;
+                horizontal-alignment: center;
+                horizontal-stretch: 1;
+                height: 15px;
+            }
+        }
+
+        // 网格:6 行按可用高度均分,窗口拉高格子就变大
+        grid-area := Rectangle {
+            vertical-stretch: 1;
+            min-height: 150px;
+            background: transparent;
+
+            GridLayout {
+                spacing: 3px;
+                for cell[i] in AppData.days : DayCellView {
+                    cell: cell;
+                    compact: root.compact;
+                    row: (i / 7).floor();
+                    col: Math.mod(i, 7);
+                    // 行高交给 GridLayout 分配:给 stretch 就会把 grid-area 的高度
+                    // 均分掉。写 `height: grid-area.height / 6` 会构成绑定环
+                    // (格子高度 ← 网格高度 ← 格子的首选高度 ← 格子内容)。
+                    vertical-stretch: 1;
+                    min-height: 26px;
+                    clicked => { Logic.select-day(cell.date); }
+                }
+            }
+        }
+
+        // 选中那天的任务
+        // 详情区高度必须固定:它和上面的网格共享垂直空间,一旦高度随任务条数
+        // 变化,网格就会被挤多挤少,整个日历跟着上下跳。任务多了在里层滚动。
+        Rectangle {
+            height: root.compact ? 96px : 190px;
+            border-radius: 10px * Theme.radius-scale;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: Theme.card;
+            drop-shadow-color: Theme.shadow;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 6px;
+
+            PanelEdge { width: parent.width - 2px; }
+
+            VerticalLayout {
+                padding: 10px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: AppData.selected-label;
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: AppData.selected-day-count > 0 ? "\{AppData.selected-day-count} 条" : "";
+                        font-size: 12px;
+                        color: Theme.text-dim;
+                        vertical-alignment: center;
+                    }
+                }
+
+                if AppData.day-todos.length == 0 : Text {
+                    text: "这天还没有安排,在上面输入框里加一条";
+                    font-size: 12px;
+                    color: Theme.text-dim;
+                    vertical-stretch: 1;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        for item in AppData.day-todos : DayTaskRow {
+                            task-id: item.id;
+                            title: item.title;
+                            done: item.done;
+                            badge: item.badge;
+                            overdue: item.overdue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

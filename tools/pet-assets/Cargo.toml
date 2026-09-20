@@ -1,0 +1,11 @@
+[package]
+name = "pet-assets"
+version = "0.1.0"
+edition = "2021"
+# 单独的小工具,**故意不并进主 crate**:它只在「换桌宠素材」时跑一次,
+# 不该把 image crate(及其一堆解码器)拖进主程序的依赖树和二进制体积。
+[workspace]
+
+[dependencies]
+# 默认特性里带 gif 解码
+image = "0.25"

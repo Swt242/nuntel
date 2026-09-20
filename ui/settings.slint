@@ -1,0 +1,413 @@
+// 设置窗口 —— 一个**独立的系统窗口**,不是主窗口里的浮层。
+//
+// 跟主窗口一样是无边框的,自己画标题栏、自己拖(WindowMoveArea)。
+// 不同的是它是**固定尺寸**的:设置面板没有缩放的意义,写死 `width`/`height`
+// 正好(按 Slint 文档,Window 的 `width` 就是固定宽度;要可缩放才得用 `preferred-*`)。
+//
+// ⚠️ 这个窗口有自己的一份 Theme / AppData / Logic 实例(全局单例不跨窗口共享,
+// 见 widgets.slint 顶部的说明)。宿主必须把主题**分别推给两个窗口**,
+// 否则切外观时这里不会跟着变。
+
+import {
+    AppData, Appearance, Backdrop, PanelEdge, Logic, Slider, Theme, VCenter, WindowButton,
+} from "widgets.slint";
+
+/// 外观预览小图。
+///
+/// 里面这几个颜色是**刻意抄**的一份,没有直接引 Theme ——
+/// Theme.blob-* / grid-line 在别的外观下是 transparent(见 Theme 里的说明),
+/// 真引了的话,一切到原主题,「毛玻璃」「工业风」那两张预览就跟着变空白,
+/// 三张卡长得一模一样,预览就没意义了。预览图要**永远画自己那套**。
+component MiniPreview inherits Rectangle {
+    in property <Appearance> style: Appearance.solid;
+    in property <bool> dark: false;
+
+    property <bool> is-glass: style == Appearance.glass;
+    property <bool> is-industrial: style == Appearance.industrial;
+
+    // 毛玻璃那两团柔光(照抄 Theme 里 glass 那份的值)
+    property <color> blob-a: dark ? #7c5cff94 : #8b5cf6cc;
+    property <color> blob-b: dark ? #22d3ee80 : #0ea5e9a6;
+    // 三套的面板填充 / 描边 / 页面底色,都写全
+    property <color> surface:
+        is-industrial ? (dark ? #181a18 : #f2f2ec)
+        : is-glass    ? (dark ? #ffffff26 : #ffffff75)
+        :               (dark ? #1a1d24 : #ffffff);
+    property <color> line:
+        is-industrial ? (dark ? #343633 : #d8d9d5)
+        : is-glass    ? (dark ? #ffffff26 : #ffffffd9)
+        :               (dark ? #2a2f3a : #e2e6ec);
+    property <color> page:
+        is-industrial ? (dark ? #101110 : #e8e8e2)
+        : is-glass    ? (dark ? #080b16 : #c9d5f2)
+        :               (dark ? #0f1115 : #eef0f4);
+    // 工业风的信号黄(顶上那根横线 + 那块选中的小方块)
+    property <color> signal: dark ? #fff500 : #fff500;
+
+    border-radius: 7px * Theme.radius-scale;
+    clip: true;
+    border-width: 1px;
+    border-color: line;
+    background: page;
+
+    // 底衬色斑:光用平涂看不出「毛玻璃」和其他两套的区别,
+    // 有颜色透上来才是毛玻璃那张卡的重点。
+    if is-glass : Rectangle {
+        x: -10px;
+        y: -18px;
+        width: 78px;
+        height: 78px;
+        background: @radial-gradient(
+            circle, root.blob-a 0%, root.blob-a.with-alpha(0) 70%,
+        );
+    }
+    if is-glass : Rectangle {
+        x: 52px;
+        y: 10px;
+        width: 74px;
+        height: 74px;
+        background: @radial-gradient(
+            circle, root.blob-b 0%, root.blob-b.with-alpha(0) 70%,
+        );
+    }
+
+    // 工业风的坐标网格。缩略图里不必还原真实密度,两三根线就够把"方格纸"说出来。
+    if is-industrial : Rectangle {
+        x: 32px;
+        y: 0;
+        width: 1px;
+        height: parent.height;
+        background: dark ? #1a1d1a : #dcdcd6;
+    }
+    if is-industrial : Rectangle {
+        x: 64px;
+        y: 0;
+        width: 1px;
+        height: parent.height;
+        background: dark ? #1a1d1a : #dcdcd6;
+    }
+    if is-industrial : Rectangle {
+        x: 96px;
+        y: 0;
+        width: 1px;
+        height: parent.height;
+        background: dark ? #1a1d1a : #dcdcd6;
+    }
+
+    // 标题条
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 14px;
+        background: root.surface;
+        border-width: 1px;
+        border-color: root.line;
+    }
+    // 工业风:标题条顶边那根信号黄横线 —— 整套风格里最显眼的一处强调色
+    if is-industrial : Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width * 0.45;
+        height: 2px;
+        background: root.signal;
+    }
+
+    // 两块「任务卡」
+    Rectangle {
+        x: 9px;
+        y: 22px;
+        width: parent.width - 18px;
+        height: 13px;
+        border-radius: 4px * Theme.radius-scale;
+        background: root.surface;
+        border-width: 1px;
+        border-color: root.line;
+    }
+    Rectangle {
+        x: 9px;
+        y: 40px;
+        width: parent.width - 18px;
+        height: 13px;
+        border-radius: 4px * Theme.radius-scale;
+        background: root.surface;
+        border-width: 1px;
+        border-color: root.line;
+    }
+    // 工业风:左下角一块信号黄的小方块(对应界面上的勾选框/徽标)
+    if is-industrial : Rectangle {
+        x: 9px;
+        y: 22px;
+        width: 5px;
+        height: 13px;
+        background: root.signal;
+    }
+}
+
+/// 一张外观选项卡:预览图 + 名字 + 选中态
+component AppearanceCard inherits Rectangle {
+    in property <string> label;
+    in property <Appearance> style: Appearance.solid;
+    in property <bool> selected: false;
+
+    callback clicked();
+
+    height: 112px;
+    border-radius: 11px * Theme.radius-scale;
+    border-width: 2px;
+    border-color: selected ? Theme.accent-ink : Theme.border;
+    background: selected ? Theme.accent-soft : Theme.card;
+
+    animate background { duration: 150ms; }
+    animate border-color { duration: 150ms; }
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        MiniPreview {
+            style: root.style;
+            height: 64px;
+        }
+
+        HorizontalLayout {
+            height: 20px;
+            spacing: 6px;
+
+            Text {
+                text: root.label;
+                font-size: 13px;
+                font-weight: root.selected ? 600 : 400;
+                color: root.selected ? Theme.accent-ink : Theme.text;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+
+            // 用 opacity 开关而不是 `if selected:` —— 让这个 14px 的位置**恒定占着**,
+            // 否则选中时标签会被勾挤窄一格,点来点去文字会左右跳。
+            Image {
+                source: @image-url("icons/check.svg");
+                width: 14px;
+                height: 14px;
+                colorize: Theme.accent-ink;
+                opacity: root.selected ? 1 : 0;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component SettingsWindow inherits Window {
+    title: "待办清单 · 设置";
+    // 固定尺寸:设置面板不需要缩放。写 `width`/`height` 就是固定(见 Slint 文档)。
+    // 宽度按三张外观卡排得下来定的:(520 - 2×16 内边距 - 2×12 间距) / 3 ≈ 154。
+    width: 520px;
+    // 高度按内容量出来的:外观三张卡 + 桌宠大小 + 10 个动画各一行滑杆。
+    // 加动画(往 assets/pet 里丢素材)就要跟着加高 —— 布局不会自己撑开窗口。
+    height: 700px;
+    background: Theme.bg;
+    no-frame: true;
+    icon: @image-url("icons/app.svg");
+    default-font-size: 14px;
+
+    // 底衬:跟主窗口同一个组件,切外观时这里也跟着变
+    Backdrop {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    body := Rectangle {
+        y: 36px;
+        width: parent.width;
+        height: parent.height - 36px;
+        background: transparent;
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 10px;
+
+            Text {
+                text: "外观主题";
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.text;
+            }
+
+            HorizontalLayout {
+                spacing: 12px;
+
+                card-solid := AppearanceCard {
+                    label: "原主题";
+                    style: Appearance.solid;
+                    selected: Theme.appearance == Appearance.solid;
+                    horizontal-stretch: 1;
+                    clicked => { Logic.set-appearance(Appearance.solid); }
+                }
+
+                card-glass := AppearanceCard {
+                    label: "毛玻璃";
+                    style: Appearance.glass;
+                    selected: Theme.appearance == Appearance.glass;
+                    horizontal-stretch: 1;
+                    clicked => { Logic.set-appearance(Appearance.glass); }
+                }
+
+                card-industrial := AppearanceCard {
+                    label: "工业风";
+                    style: Appearance.industrial;
+                    selected: Theme.appearance == Appearance.industrial;
+                    horizontal-stretch: 1;
+                    clicked => { Logic.set-appearance(Appearance.industrial); }
+                }
+            }
+
+            Text {
+                text: "选中立刻生效,并记到下次启动";
+                font-size: 11px;
+                color: Theme.text-dim;
+            }
+
+            // ── 桌宠 ──
+            // 两个都是**边拖边生效**的:拖动时立刻看到/看到宠物的变化,
+            // 而不是松手才动一下。数字显示在右边,拖到位了看得见具体值。
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+
+            Text {
+                text: "桌宠";
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.text;
+            }
+
+            pet-size-row := HorizontalLayout {
+                spacing: 10px;
+
+                Text {
+                    text: "大小";
+                    width: 48px;
+                    font-size: 12px;
+                    color: Theme.text-dim;
+                    vertical-alignment: center;
+                }
+
+                Slider {
+                    min: 64;
+                    max: 200;
+                    value: AppData.pet-size;
+                    horizontal-stretch: 1;
+                    moved-to(v) => { Logic.set-pet-size(v); }
+                }
+
+                Text {
+                    text: "\{Math.round(AppData.pet-size)} px";
+                    width: 52px;
+                    font-size: 12px;
+                    color: Theme.text;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+            }
+
+            // ── 每个动画单独调速 ──
+            //
+            // 一行一个动画:名字 + 滑杆 + 当前倍率。**不做两列**:名字最长有 6 个字
+            // (「待机·纸飞机」),挤成两列就得砍名字,得不偿失;竖着排长一点无所谓。
+            //
+            // 列表本身由宿主推(动画名来自 assets/pet/manifest.json,加动画不用改这里)。
+            // 拖动时**不要**把新列表推回来 —— 那样 `for` 会把整行重建,正在拖的那根
+            // 滑杆会被换掉,手感直接断掉(和当初滚轮那个「赋值后立刻读」是同一类坑)。
+            Text {
+                text: "动画速度(每个动画单独调)";
+                font-size: 12px;
+                color: Theme.text-dim;
+            }
+
+            // 外面这层只为把行距收紧(外层 VerticalLayout 的 spacing 是 10,
+            // 10 行就多出去 60px;列表本身也该排得比「区块之间」密)
+            VerticalLayout {
+                spacing: 4px;
+                // 不参与拉伸:否则窗口高一点点,这段就会被居中/均分,
+                // 每一行的位置跟着飘 —— 靠坐标点击来验证/自动化时会莫名其妙点空。
+                vertical-stretch: 0;
+
+                for anim in AppData.pet-anims : HorizontalLayout {
+                    height: 22px;
+                    spacing: 8px;
+
+                    Text {
+                        text: anim.label;
+                        width: 80px;
+                        font-size: 12px;
+                        color: Theme.text-dim;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    Slider {
+                        min: 0.25;
+                        max: 3;
+                        value: anim.speed;
+                        horizontal-stretch: 1;
+                        moved-to(v) => { Logic.set-pet-anim-speed(anim.name, v); }
+                    }
+
+                    Text {
+                        // 两位小数:1.25× 这种中间值也要看得出区别
+                        text: "\{Math.round(anim.speed * 100) / 100}×";
+                        width: 44px;
+                        font-size: 12px;
+                        color: Theme.text;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+
+    // 标题栏:画在最后 = 浮在最上层(跟主窗口一个套路)
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 36px;
+        background: Theme.card;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        PanelEdge { width: parent.width - 2px; }
+
+        move-area := WindowMoveArea {
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 4px;
+                spacing: 8px;
+
+                Text {
+                    text: "设置";
+                    font-size: 12px;
+                    color: Theme.text-dim;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+
+                VCenter {
+                    win-close := WindowButton {
+                        icon: @image-url("icons/win-close.svg");
+                        danger: true;
+                        clicked => { Logic.close-settings(); }
+                    }
+                }
+            }
+        }
+    }
+}

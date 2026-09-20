@@ -1,0 +1,14 @@
+{
+  "AppData": {
+    "todos": [
+      { "id": 1, "title": "读一遍 Slint 官方的 AI 插件 skill", "done": true },
+      { "id": 2, "title": "用 Rust + Slint 写一个待办清单", "done": true },
+      { "id": 3, "title": "双击标题可以就地编辑,回车保存、Esc 取消", "done": false },
+      { "id": 4, "title": "这条标题很长,用来确认超长文本会被省略号截断而不是把行撑开", "done": false },
+      { "id": 5, "title": "数据保存在 AppData/Roaming/rgui-todo/todos.json", "done": false }
+    ],
+    "remaining": 3,
+    "completed": 2,
+    "filter": "all"
+  }
+}

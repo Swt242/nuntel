@@ -1,0 +1,169 @@
+// 周视图:周一到周日竖着排 7 个格子,每格一天。
+//
+// 格子里的内容是「日期 + 星期 + 农历/节日 + 当天任务」。
+// 格子大小和月视图一个道理:写死 preferred-height,7 格一样高,
+// 窗口变大再按 stretch 均分;装不下的任务由 clip 裁掉,靠右上角的数量角标提示。
+
+import {
+    AppData, PanelEdge, Logic, Theme, TodoCheck, TimeBadge, WeekDay, IconButton, TextButton, VCenter,
+} from "widgets.slint";
+
+component WeekDayCard inherits Rectangle {
+    in property <WeekDay> day;
+
+    // 高度统一由外层给定(Rust 按窗口高度算好),不看内容 ——
+    // 不然任务多的那天会把整格撑高,一格高一行矮。
+    height: AppData.week-card-height * 1px;
+    clip: true;
+
+    border-radius: 8px * Theme.radius-scale;
+    border-width: 1px;
+    border-color: day.is-today ? Theme.accent-ink : Theme.border;
+    background: day.is-today ? Theme.accent-soft : Theme.card;
+
+    PanelEdge { width: parent.width - 2px; }
+
+    VerticalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        spacing: 2px;
+
+        // ── 头一行:日期 + 星期 + 今天 + 农历/节日 + 休/班 + 数量 ──
+        card-head := HorizontalLayout {
+            height: 17px;
+            spacing: 7px;
+
+            Text {
+                text: root.day.label;
+                font-size: 12px;
+                font-weight: 600;
+                vertical-alignment: center;
+                color: root.day.is-today ? Theme.accent-ink : Theme.text;
+            }
+
+            Text {
+                text: root.day.sub;
+                font-size: 11px;
+                vertical-alignment: center;
+                color: root.day.is-festival ? Theme.danger : Theme.text-dim;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            if root.day.work : Text {
+                text: "班";
+                font-size: 10px;
+                vertical-alignment: center;
+                color: Theme.text-dim;
+            }
+            if root.day.rest && !root.day.work : Text {
+                text: "休";
+                font-size: 10px;
+                vertical-alignment: center;
+                color: Theme.danger;
+            }
+
+            // 有几条任务。格子放不下时它就是提醒
+            if root.day.count > 0 : Rectangle {
+                width: 15px;
+                height: 15px;
+                border-radius: 8px * Theme.radius-scale;
+                background: Theme.accent;
+
+                Text {
+                    text: "\{root.day.count}";
+                    font-size: 9px;
+                    color: Theme.accent-fg;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // ── 当天的任务 ──
+        for task in root.day.tasks : HorizontalLayout {
+            height: 19px;
+            spacing: 7px;
+
+            TodoCheck {
+                width: 14px;
+                height: 14px;
+                checked: task.done;
+                toggled => { Logic.toggle-day-task(task.id); }
+            }
+
+            Text {
+                text: task.title;
+                font-size: 12px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                wrap: no-wrap;
+                overflow: elide;
+                color: task.done ? Theme.text-dim : Theme.text;
+            }
+
+            VCenter {
+                if task.badge != "" : TimeBadge {
+                    text: task.badge;
+                    overdue: task.overdue;
+                }
+            }
+        }
+    }
+}
+
+export component WeekView inherits Rectangle {
+    background: transparent;
+    // 组件被当成布局项用时,外部会给实例设 vertical-stretch;这里再声明一次,
+    // 保证「周视图铺满可用高度」这件事不依赖调用方。
+    vertical-stretch: 1;
+
+    week-root := VerticalLayout {
+        vertical-stretch: 1;
+        spacing: 6px;
+
+        HorizontalLayout {
+            spacing: 6px;
+
+            week-prev := IconButton {
+                icon: @image-url("icons/chevron-left.svg");
+                icon-size: 15px;
+                clicked => { Logic.shift-week(-1); }
+            }
+            Text {
+                text: AppData.week-label;
+                font-size: 15px;
+                font-weight: 600;
+                color: Theme.text;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+                horizontal-stretch: 1;
+            }
+            week-next := IconButton {
+                icon: @image-url("icons/chevron-right.svg");
+                icon-size: 15px;
+                clicked => { Logic.shift-week(1); }
+            }
+            goto-today := TextButton {
+                label: "今天";
+                clicked => { Logic.goto_today(); }
+            }
+        }
+
+        // 7 个格子,从上到下周一 → 周日。
+        // 高度按可用空间均分(不能只靠 stretch:preferred-height 一写死,
+        // Slint 就一直按它算,结果 7 格缩在顶上不铺满)。
+        week-area := Rectangle {
+            vertical-stretch: 1;
+            background: transparent;
+
+            VerticalLayout {
+                spacing: 4px;
+
+                for day in AppData.week-days : WeekDayCard { day: day; }
+            }
+        }
+    }
+}

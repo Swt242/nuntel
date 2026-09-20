@@ -1,0 +1,1093 @@
+// 待办清单 —— 主窗口
+//
+// 这里只负责渲染与转发交互:任务数据、视图状态、时间编辑状态都由 Rust 持有
+// (AppData 是宿主推给 UI 的状态,Logic 是 UI 回调宿主的动作)。
+// 共享的令牌与控件在 widgets.slint,日历在 calendar.slint。
+
+import {
+    DatePickerPopup, ScrollView, TimePickerPopup,
+} from "std-widgets.slint";
+import {
+    AppData, Backdrop, Filter, PanelEdge, Logic, RemindOptions, Theme, TimeBadge, TimeOption,
+    TodoCheck, TodoItem, View,
+    Chip, FilterTab, IconButton, PrimaryButton, TextButton, Toggle, VCenter, WindowButton,
+} from "widgets.slint";
+import { CalendarView } from "calendar.slint";
+import { WeekView } from "week.slint";
+import { SettingsWindow } from "settings.slint";
+import { PetWindow } from "pet.slint";
+
+// 从别的文件再导出:Slint 只把**主文件**里可见的类型/全局当作公开 API,
+// 不加这几行的话 Rust 侧就看不到它们(Rust 里会只给个 deprecated 别名)。
+export {
+    AppData, Logic, RemindOptions, Theme,
+    Appearance, DayCell, Filter, ThemePreference, TodoItem, View, WeekDay,
+} from "widgets.slint";
+// 设置窗口也要从主文件导出,Rust 侧才能 `SettingsWindow::new()`
+export { SettingsWindow } from "settings.slint";
+// 桌宠也是独立窗口,同样要从主文件导出 Rust 才拿得到
+export { PetWindow } from "pet.slint";
+
+// ── 列表里的一行 ──────────────────────────────────────────────────────
+
+component TodoRow inherits Rectangle {
+    in property <TodoItem> item;
+    in property <bool> editing: false;
+
+    callback toggled();
+    callback removed();
+    callback edit-began();
+    callback committed(string);
+    callback cancelled();
+    callback time-clicked();
+
+    height: 52px;
+    border-radius: 10px * Theme.radius-scale;
+    // 提醒没确认时整行高亮
+    background: root.item.alerting ? Theme.accent-soft
+        : ((hover.has-hover && !editing) ? Theme.hover : transparent);
+
+    animate background { duration: 150ms; }
+
+    // 放在最前面 = 最底层,不会挡住勾选框和按钮
+    hover := TouchArea {
+        mouse-cursor: pointer;
+        double-clicked => { root.edit-began(); }
+    }
+
+    if root.item.alerting : Rectangle {
+        width: 3px;
+        height: 24px;
+        border-radius: 2px * Theme.radius-scale;
+        background: Theme.accent;
+        x: 0;
+        y: (parent.height - self.height) / 2;
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 6px;
+        spacing: 10px;
+
+        VCenter {
+            check := TodoCheck {
+                checked: root.item.done;
+                toggled => { root.toggled(); }
+            }
+        }
+
+        if !editing : Text {
+            text: root.item.title;
+            font-size: 14px;
+            font-weight: root.item.alerting ? 700 : 400;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            wrap: no-wrap;
+            overflow: elide;
+            color: root.item.done ? Theme.text-dim : Theme.text;
+        }
+
+        if editing : Rectangle {
+            height: 34px;
+            border-radius: 8px * Theme.radius-scale;
+            background: Theme.card;
+            border-width: 1px;
+            border-color: Theme.accent-ink;
+            horizontal-stretch: 1;
+
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+
+                edit-field := TextInput {
+                    text <=> AppData.edit-text;
+                    color: Theme.text;
+                    font-size: 14px;
+                    single-line: true;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    init => { self.focus(); }
+                    accepted => { root.committed(AppData.edit-text); }
+                    // 只接管 Esc;其余按键必须 reject,否则 TextInput 内置的
+                    // 编辑逻辑不会执行(字打不进去)。
+                    key-pressed(ev) => {
+                        if (ev.text == Key.Escape) {
+                            root.cancelled();
+                            accept
+                        } else {
+                            reject
+                        }
+                    }
+                }
+            }
+        }
+
+        // 时间徽标
+        VCenter {
+            if !editing && root.item.badge != "" : TimeBadge {
+                text: root.item.badge;
+                overdue: root.item.overdue;
+            }
+        }
+
+        // 设时间:平时藏起来,悬停或已有时间时露出来
+        VCenter {
+            clock := IconButton {
+                icon: @image-url("icons/clock.svg");
+                icon-size: 15px;
+                enabled: hover.has-hover || clock.hovered || editing || root.item.badge != "";
+                disabled-opacity: 0;
+                clicked => { root.time-clicked(); }
+            }
+        }
+
+        VCenter {
+            delete := IconButton {
+                icon: @image-url("icons/x.svg");
+                icon-size: 15px;
+                danger: true;
+                enabled: hover.has-hover || delete.hovered || editing;
+                disabled-opacity: 0;
+                clicked => { root.removed(); }
+            }
+        }
+    }
+}
+
+// ── 滚轮式时刻选择器 ─────────────────────────────────────────────────
+//
+// 上下拖动选值,松手之后**会继续滑一段再停** —— 就是 Vue 那套时间选择控件
+// (Vant / Element)的手感。
+//
+// ⚠️ **位置不由这个组件自己管,而是宿主推过来的**(`pos` 是 in 属性)。
+// 原因:惯性滑动要按时间积分(指数阻尼),而 Slint 语言**读不到时钟** ——
+// 估不出速度,也没法逐帧推进。所以拖动时它只负责"把手指拖到哪了"报上去,
+// 宿主夹好范围再推回来。这是同线程的同步调用,不走事件循环,所以没有延迟感。
+//
+// 也因此这里**没有任何 `animate`** —— 平滑完全由宿主每 16ms 推进一次来做。
+// (早先这里挂过 `animate` 并踩了大坑:带 animate 的属性"写完立刻读"读到的是
+// 动画起点,表现成整个轮子纹丝不动。见 docs §20.4。)
+component WheelColumn inherits Rectangle {
+    in property <[TimeOption]> options;
+    /// 停在哪个浮点位置(单位:格)。整数 = 正好居中;小数 = 正在滑动途中。
+    in property <float> pos: 0;
+    /// 0 = 时,1 = 分。回调原样带回去,宿主才知道是哪个轮在动。
+    in property <int> kind: 0;
+
+    callback drag-started(int);
+    callback dragged(int, float);
+    callback drag-ended(int);
+    /// 鼠标滚轮拨一格(kind, delta)
+    callback nudged(int, int);
+
+    /// 每格高度
+    property <length> row-height: 28px;
+    /// 可见几行(奇数,正中间那行是选中)
+    property <int> rows: 5;
+    /// 离中间最近的那一项 —— 高亮的就是它
+    property <int> active:
+        Math.max(0, Math.min(root.options.length - 1, Math.round(root.pos)));
+
+    clip: true;
+    background: transparent;
+    // 可视高度就是 rows 行。首尾两项能停在中间靠的是宿主把 pos 夹在 [0, n-1] ——
+    // 数字是按绝对坐标画的,不受这个高度限制,超出的被 clip 裁掉。
+    height: root.rows * root.row-height;
+
+    // 中间那条高亮带。声明在文字前面 = 画在最底层,不会挡住数字。
+    Rectangle {
+        y: (parent.height - root.row-height) / 2;
+        width: parent.width;
+        height: root.row-height;
+        background: Theme.hover;
+        border-width: 1px;
+        border-color: Theme.border;
+    }
+
+    // 数字。位置由「离中间几格」直接算出来,不走布局 ——
+    // 布局是按顺序排的,而这里每一项的 y 是 pos 的连续函数。
+    for opt[i] in root.options : Text {
+        text: opt.label;
+        width: parent.width;
+        height: root.row-height;
+        y: parent.height / 2 - root.row-height / 2 + (i - root.pos) * root.row-height;
+        font-size: 15px;
+        font-weight: i == root.active ? 700 : 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: i == root.active ? Theme.accent-ink : Theme.text;
+        // 越远离中间越淡 —— 没有渐变遮罩,用透明度做出"淡出"的效果
+        opacity: Math.max(0.22, 1 - Math.abs(i - root.pos) * 0.34);
+    }
+
+    touch := TouchArea {
+        property <length> drag-start-y: 0;
+        property <float> drag-start-pos: 0;
+        /// 这一轮按下期间手指有没有动过 —— 没动过就是"点选某一行"
+        property <bool> moved-any: false;
+
+        mouse-cursor: pointer;
+
+        // TouchArea 没有「刚按下」的回调(`pressed` 是个 out 属性),
+        // 所以按下 / 松手靠监听这个属性的**变化**来捕捉。
+        changed pressed => {
+            if (self.pressed) {
+                moved-any = false;
+                drag-start-y = self.mouse-y;
+                drag-start-pos = root.pos;
+                root.drag-started(root.kind);
+            } else {
+                // 手指没动过 = 点了某一行 → 直接跳到那一行。
+                // 滚轮本来就该能拖,但差一两格时点一下比拖一下准。
+                if (!self.moved-any) {
+                    root.dragged(
+                        root.kind,
+                        root.pos + (self.mouse-y - self.height / 2) / root.row-height,
+                    );
+                }
+                root.drag-ended(root.kind);
+            }
+        }
+
+        // 只有按住时才会被调用,所以这里不用再判一遍 pressed
+        moved => {
+            if (self.pressed) {
+                self.moved-any = true;
+                // 手指往上拖 = 内容往上走 = pos 变大
+                root.dragged(
+                    root.kind,
+                    drag-start-pos - (self.mouse-y - drag-start-y) / root.row-height,
+                );
+            }
+        }
+
+        // 鼠标滚轮:一格一格拨。**故意不走拖动那一套。**
+        //
+        // 拨一格就是「值 ±1」,跟位置、速度、惯性都没关系。之前图省事让它假扮成
+        // 一次拖动(started → dragged → ended 三个回调连发),结果位置改归宿主管之后,
+        // 少调一个 `drag-started` 就整个失灵的 —— 宿主那边找不到拖动状态直接 return。
+        // 点/拖都好使、只有滚轮纹丝不动,查起来还挺费劲。给它一条自己的路就没这问题。
+        scroll-event(ev) => {
+            if (ev.delta-y != 0px) {
+                root.nudged(root.kind, ev.delta-y > 0px ? 1 : -1);
+            }
+            EventResult.accept
+        }
+    }
+}
+
+
+// ── 主窗口 ───────────────────────────────────────────────────────────
+
+export component AppWindow inherits Window {
+    title: "待办清单";
+    // 用 preferred-* 而不是 width/height:按 Slint 文档,写 `width` 是
+    // **固定宽度**(窗口就拉不动了),`preferred-width` 才是初始尺寸且可缩放。
+    // 尺寸按实际使用定下来的:476×826 是「周视图 7 格 + 上面那些条」都能排得下的
+    // 大小,所以直接把它当最小尺寸 —— 再小就得裁内容了。
+    preferred-width: 476px;
+    preferred-height: 826px;
+    min-width: 476px;
+    min-height: 826px;
+    background: Theme.bg;
+    // 自己去画标题栏,所以不要系统边框;无边框窗口四边留一点宽度给人拖拽缩放
+    no-frame: true;
+    resize-border-width: 6px;
+    icon: @image-url("icons/app.svg");
+    default-font-size: 14px;
+
+    // 底衬:底色 + 三团柔光色斑。声明在最前面 = 画在最底层,后面的内容都压在它上面。
+    // 这是毛玻璃的「底下那层」,没有它,所有半透明面板透出来都是一片灰。
+    backdrop := Backdrop {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    // 内容列:限宽 + 居中 + 铺满窗口。
+    // 注意尺寸是设在这个 Rectangle 上、而不是里面的布局上 ——
+    // 给布局元素本身写死 height,它反而不会把多余空间分给带 stretch 的子项,
+    // 表现就是「下方留一大截空白、该撑开的区域缩在顶部」。
+    content-col := Rectangle {
+        width: min(1100px, parent.width);
+        height: parent.height;
+        x: (parent.width - self.width) / 2;
+        background: transparent;
+
+    main-col := VerticalLayout {
+        // 上边留出标题栏的高度(标题栏是浮在最上面的,见文件末尾)
+        padding-top: 52px;
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-bottom: 16px;
+        spacing: 10px;
+
+        // 标题
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "我的一天";
+                font-size: 22px;
+                font-weight: 700;
+                color: Theme.text;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: (AppData.remaining + AppData.completed) == 0 ? "暂无任务"
+                    : (AppData.remaining > 0 ? "\{AppData.remaining} 项待办" : "全部完成");
+                font-size: 13px;
+                color: AppData.remaining > 0 ? Theme.text-dim : Theme.accent-ink;
+                vertical-alignment: center;
+            }
+            theme-toggle := IconButton {
+                icon: Theme.dark ? @image-url("icons/moon.svg") : @image-url("icons/sun.svg");
+                icon-size: 17px;
+                clicked => { Logic.cycle-theme(); }
+            }
+        }
+
+        // 提醒横幅:有没确认的提醒时顶上来
+        if AppData.pending-count > 0 : Rectangle {
+            height: 40px;
+            border-radius: 10px * Theme.radius-scale;
+            border-width: 1px;
+            border-color: Theme.accent-ink.with-alpha(0.45);
+            background: Theme.accent-soft;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 6px;
+                spacing: 8px;
+
+                VCenter {
+                    Image {
+                        source: @image-url("icons/clock.svg");
+                        width: 16px;
+                        height: 16px;
+                        colorize: Theme.accent-ink;
+                    }
+                }
+                Text {
+                    text: AppData.pending-count == 1
+                        ? "提醒:\{AppData.pending-title}"
+                        : "有 \{AppData.pending-count} 条提醒";
+                    font-size: 13px;
+                    color: Theme.text;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+                VCenter {
+                    banner-ack := TextButton {
+                        label: "知道了";
+                        clicked => { Logic.acknowledge-reminders(); }
+                    }
+                }
+            }
+        }
+
+        // 视图切换
+        Rectangle {
+            height: 32px;
+            border-radius: 9px * Theme.radius-scale;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: Theme.inset;
+
+            HorizontalLayout {
+                padding: 3px;
+                spacing: 3px;
+
+                view-list := FilterTab {
+                    label: "清单";
+                    selected: AppData.view == View.list;
+                    horizontal-stretch: 1;
+                    clicked => { Logic.set-view(View.list); }
+                }
+                view-calendar := FilterTab {
+                    label: "日历";
+                    selected: AppData.view == View.calendar;
+                    horizontal-stretch: 1;
+                    clicked => { Logic.set-view(View.calendar); }
+                }
+                view-week := FilterTab {
+                    label: "周";
+                    selected: AppData.view == View.week;
+                    horizontal-stretch: 1;
+                    clicked => { Logic.set-view(View.week); }
+                }
+            }
+        }
+
+        // 新建任务(日历视图下加到选中的那一天)
+        Rectangle {
+            height: 48px;
+            border-radius: 12px * Theme.radius-scale;
+            background: Theme.card;
+            border-width: 1px;
+            border-color: input.has-focus ? Theme.accent-ink : Theme.border;
+            // 浮起来的一块:顶部高光 + 投影
+            drop-shadow-color: Theme.shadow;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 6px;
+
+            animate border-color { duration: 150ms; }
+
+            PanelEdge { width: parent.width - 2px; }
+
+            // 最底层:点输入框外的空白也能聚焦
+            TouchArea {
+                clicked => { input.focus(); }
+            }
+
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 7px;
+                spacing: 8px;
+
+                input := TextInput {
+                    text <=> AppData.draft;
+                    color: Theme.text;
+                    font-size: 14px;
+                    single-line: true;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    accepted => { Logic.add-task(AppData.draft); }
+                }
+
+                VCenter {
+                    add-button := IconButton {
+                        icon: @image-url("icons/plus.svg");
+                        icon-size: 17px;
+                        enabled: !AppData.draft.is-empty;
+                        clicked => { Logic.add-task(AppData.draft); }
+                    }
+                }
+            }
+
+            // TextInput 没有 placeholder,空且失焦时自己画一个
+            if AppData.draft.is-empty && !input.has-focus : Text {
+                text: AppData.view == View.list
+                    ? "添加一个任务,回车确认"
+                    : "添加到 \{AppData.selected-label}";
+                color: Theme.text-dim;
+                font-size: 14px;
+                x: 14px;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+
+        // ── 清单视图 ──
+        if AppData.view == View.list : Rectangle {
+            vertical-stretch: 1;
+            background: transparent;
+
+            VerticalLayout {
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Rectangle {
+                        height: 36px;
+                        border-radius: 10px * Theme.radius-scale;
+                        background: Theme.inset;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        horizontal-stretch: 1;
+
+                        HorizontalLayout {
+                            padding: 3px;
+                            spacing: 3px;
+
+                            tab-all := FilterTab {
+                                label: "全部";
+                                selected: AppData.filter == Filter.all;
+                                horizontal-stretch: 1;
+                                clicked => { Logic.set-filter(Filter.all); }
+                            }
+                            tab-active := FilterTab {
+                                label: "未完成";
+                                selected: AppData.filter == Filter.active;
+                                horizontal-stretch: 1;
+                                clicked => { Logic.set-filter(Filter.active); }
+                            }
+                            tab-done := FilterTab {
+                                label: "已完成";
+                                selected: AppData.filter == Filter.completed;
+                                horizontal-stretch: 1;
+                                clicked => { Logic.set-filter(Filter.completed); }
+                            }
+                        }
+                    }
+
+                    // 双向:还有没完成的就全勾上,都完成了就全取消
+                    VCenter {
+                        toggle-all := TextButton {
+                            label: AppData.remaining > 0 ? "全部完成" : "全部取消";
+                            enabled: (AppData.remaining + AppData.completed) > 0;
+                            clicked => { Logic.toggle-all(); }
+                        }
+                    }
+                }
+
+                // 用 ScrollView + for 而不是 ListView:ListView 会回收/重建行,
+                // 正在编辑的那一行如果被回收,输入框和焦点会一起丢掉。
+                // 待办列表撑死几百行,不做虚拟化完全可以接受,换就地编辑稳定。
+                if AppData.todos.length > 0 : ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        for item[i] in AppData.todos : TodoRow {
+                            item: item;
+                            editing: AppData.editing-id == item.id;
+                            toggled => { Logic.toggle-task(item.id); }
+                            removed => { Logic.remove-task(item.id); }
+                            edit-began => { Logic.begin-edit(item.id); }
+                            committed(text) => { Logic.commit-edit(text); }
+                            cancelled => { Logic.cancel-edit(); }
+                            time-clicked => { Logic.open-time-editor(item.id); }
+                        }
+                    }
+                }
+
+                if AppData.todos.length == 0 : Rectangle {
+                    vertical-stretch: 1;
+                    background: transparent;
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 10px;
+
+                        Image {
+                            source: @image-url("icons/clipboard.svg");
+                            width: 72px;
+                            height: 72px;
+                            colorize: Theme.border-strong;
+                        }
+                        Text {
+                            text: AppData.filter == Filter.completed ? "还没有已完成的任务"
+                                : (AppData.filter == Filter.active ? "没有未完成的任务,休息一下"
+                                : "还没有任务,在上面添加一条吧");
+                            color: Theme.text-dim;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 日历视图 ──
+        if AppData.view == View.calendar : CalendarView {
+            vertical-stretch: 1;
+            compact: AppData.compact-cells;
+        }
+
+        // ── 周视图 ──
+        if AppData.view == View.week : WeekView {
+            vertical-stretch: 1;
+        }
+
+        // 底栏
+        HorizontalLayout {
+            spacing: 8px;
+
+            VCenter {
+                autostart-toggle := Toggle {
+                    label: "开机自启";
+                    checked: AppData.autostart;
+                    // 开关状态以宿主为准(写注册表可能失败)
+                    toggled => { Logic.set-autostart(self.checked); }
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            Text {
+                text: "\{AppData.completed}/\{AppData.completed + AppData.remaining} 已完成";
+                font-size: 12px;
+                color: Theme.text-dim;
+                vertical-alignment: center;
+            }
+            VCenter {
+                clear-done := TextButton {
+                    label: "清除已完成";
+                    enabled: AppData.completed > 0;
+                    clicked => { Logic.clear-completed(); }
+                }
+            }
+        }
+    }
+
+    }
+
+    // ── 自定义标题栏 ─────────────────────────────────────────────────
+    // 画在主布局之后 = 浮在最上层。
+    // 拖动交给 Slint 的 WindowMoveArea(底层就是系统的窗口移动),所以贴靠、
+    // 拖到屏幕顶部最大化这些和原生窗口一致;单纯点击不会移动窗口,里面的按钮照样能点。
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 36px;
+        // 标题栏是「玻璃 chrome」:半透明 + 一道发丝边勾出玻璃边缘。
+        // 原主题把这圈边去掉,跟改造前一致(那时标题栏是块实心条,没有边框)。
+        background: Theme.card;
+        border-width: 1px;
+        border-color: Theme.glass ? Theme.border : transparent;
+
+        PanelEdge { width: parent.width - 2px; }
+
+        move-area := WindowMoveArea {
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 4px;
+                spacing: 8px;
+
+                VCenter {
+                    Image {
+                        source: @image-url("icons/app.svg");
+                        width: 16px;
+                        height: 16px;
+                    }
+                }
+
+                Text {
+                    text: "待办清单";
+                    font-size: 12px;
+                    color: Theme.text-dim;
+                    vertical-alignment: center;
+                }
+
+                // 双击标题栏 = 最大化/还原
+                titlebar-dblclick := TouchArea {
+                    horizontal-stretch: 1;
+                    double-clicked => { Logic.toggle-maximize(); }
+                }
+
+                // 设置入口。放窗口控制按钮左边,跟它们隔开一点,
+                // 免得想点最小化却点到设置。
+                VCenter {
+                    settings-button := IconButton {
+                        icon: @image-url("icons/settings.svg");
+                        icon-size: 16px;
+                        clicked => { Logic.open-settings(); }
+                    }
+                }
+
+                VCenter {
+                    win-min := WindowButton {
+                        icon: @image-url("icons/win-min.svg");
+                        clicked => { Logic.minimize-window(); }
+                    }
+                }
+                VCenter {
+                    win-max := WindowButton {
+                        icon: AppData.maximized
+                            ? @image-url("icons/win-restore.svg")
+                            : @image-url("icons/win-max.svg");
+                        clicked => { Logic.toggle-maximize(); }
+                    }
+                }
+                VCenter {
+                    win-close := WindowButton {
+                        icon: @image-url("icons/win-close.svg");
+                        danger: true;
+                        clicked => { Logic.hide-window(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 时间设置浮层 ──────────────────────────────────────────────────
+    if AppData.editor-id >= 0 : Rectangle {
+        background: Theme.scrim;
+
+        TouchArea {
+            clicked => { Logic.close-time-editor(); }
+        }
+
+        editor-card := Rectangle {
+            // 400 宽是给「时/分」那两排 12 列数字块留的:
+            // 12 × 24 + 11 × 2 间距 + 左边的「时」标签,正好排得下。
+            width: min(400px, parent.width - 40px);
+            height: card-layout.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 14px * Theme.radius-scale;
+            // 用 sheet 而不是 card:浮层底下压着真实内容,太透会变成「字压字」
+            background: Theme.sheet;
+            border-width: 1px;
+            border-color: Theme.border;
+            // 浮层是全场唯一真正「飘」在别的东西上面的玻璃,投影给足。
+            // 遗憾:web 上浮层背后那层是 backdrop-filter 糊掉的,这里没有模糊,
+            // 只能用更重的 scrim 盖 + 把浮层本身做厚(见 Theme.sheet)。
+            drop-shadow-color: Theme.shadow;
+            drop-shadow-blur: 40px;
+            drop-shadow-offset-y: 14px;
+
+            PanelEdge { width: parent.width - 2px; }
+
+            card-layout := VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                Text {
+                    text: "设置时间";
+                    font-size: 15px;
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                Text {
+                    text: AppData.editor-title;
+                    font-size: 12px;
+                    color: Theme.text-dim;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+
+                // ══ 日期:两套实现,靠 AppData.use-native-pickers 切 ══
+                //   true  = Slint 自带的 DatePickerPopup(表盘式,成熟)
+                //   false = 自己写的月历,配色跟主题完全一致
+                // 两套都留着,想切回去改宿主里的 USE_NATIVE_PICKERS 常量。
+
+                if AppData.use-native-pickers : HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "日期";
+                        font-size: 13px;
+                        color: Theme.text-dim;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    VCenter {
+                        native-date-button := TextButton {
+                            label: AppData.editor-date-label;
+                            clicked => {
+                                native-date-popup.show();
+                            }
+                        }
+                    }
+                    VCenter {
+                        native-day-today := TextButton { label: "今天"; clicked => { Logic.set-editor-day(0); } }
+                    }
+                    VCenter {
+                        native-day-tomorrow := TextButton { label: "明天"; clicked => { Logic.set-editor-day(1); } }
+                    }
+                }
+
+                // ── 自写:点月历选,没有输入框 ──
+                //
+                // 以前这儿是个 TextInput,用户能敲出「2026-13-45」这种非法值,
+                // 只能等保存时报错。换成月历后能选的日期**天然合法**,
+                // 顺带还能看见哪几天是周末/法定假日(底色压暗那几格)。
+                if !AppData.use-native-pickers : HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "日期";
+                        font-size: 13px;
+                        color: Theme.text-dim;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: AppData.editor-date-label;
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: Theme.accent-ink;
+                        vertical-alignment: center;
+                    }
+                    VCenter {
+                        day-today := TextButton { label: "今天"; clicked => { Logic.set-editor-day(0); } }
+                    }
+                    VCenter {
+                        day-tomorrow := TextButton { label: "明天"; clicked => { Logic.set-editor-day(1); } }
+                    }
+                }
+
+                // 面板底色用 card、休息日格子用 inset —— **和主日历同一套关系**
+                // (主日历就是「普通格 = card、休息日 = inset」)。
+                // 一开始这里写反了:面板 inset、休息日 card,结果工业风和原主题下
+                // card 和浮层的 sheet 是同一个颜色,休息日格子跟普通格**完全看不出来**。
+                if !AppData.use-native-pickers : Rectangle {
+                    border-radius: 10px * Theme.radius-scale;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: Theme.card;
+
+                    date-picker := VerticalLayout {
+                        padding: 6px;
+                        spacing: 3px;
+
+                        HorizontalLayout {
+                            spacing: 2px;
+                            month-prev := IconButton {
+                                icon: @image-url("icons/chevron-left.svg");
+                                icon-size: 14px;
+                                clicked => { Logic.shift-editor-month(-1); }
+                            }
+                            Text {
+                                text: AppData.editor-month-label;
+                                font-size: 13px;
+                                font-weight: 600;
+                                color: Theme.text;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            month-next := IconButton {
+                                icon: @image-url("icons/chevron-right.svg");
+                                icon-size: 14px;
+                                clicked => { Logic.shift-editor-month(1); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            for name in ["一", "二", "三", "四", "五", "六", "日"] : Text {
+                                text: name;
+                                font-size: 10px;
+                                color: Theme.text-dim;
+                                horizontal-alignment: center;
+                                horizontal-stretch: 1;
+                                height: 14px;
+                            }
+                        }
+
+                        // 格子必须写 preferred-width:GridLayout 的列宽是按内容算的,
+                        // 不写的话「1」和「28」会把各自那一列撑成不同宽度。
+                        GridLayout {
+                            spacing: 2px;
+                            for cell[i] in AppData.editor-days : Rectangle {
+                                row: (i / 7).floor();
+                                col: Math.mod(i, 7);
+                                preferred-width: 34px;
+                                horizontal-stretch: 1;
+                                height: 24px;
+                                border-radius: 5px * Theme.radius-scale;
+                                border-width: 1px;
+                                border-color: cell.is-selected ? Theme.accent-ink
+                                    : (Theme.glass ? Theme.border : transparent);
+                                background: cell.is-selected ? Theme.accent-soft
+                                    : (cell.rest ? Theme.inset : transparent);
+
+                                Text {
+                                    text: "\{cell.day}";
+                                    font-size: 11px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    color: cell.is-selected ? Theme.accent-ink
+                                        : (cell.in-month
+                                            ? (cell.is-today ? Theme.accent-ink : Theme.text)
+                                            : Theme.text-dim.with-alpha(0.45));
+                                }
+
+                                picker-touch := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { Logic.pick-editor-day(cell.date); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── 时刻:同上,两套 ──
+                if AppData.use-native-pickers : HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "时间";
+                        font-size: 13px;
+                        color: Theme.text-dim;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    VCenter {
+                        native-time-button := TextButton {
+                            label: AppData.editor-time-label;
+                            // 全天任务没有具体时刻,按钮置灰(跟自写那套收起来是一个意思)
+                            enabled: !AppData.editor-all-day;
+                            clicked => {
+                                native-time-popup.show();
+                            }
+                        }
+                    }
+                    VCenter {
+                        Toggle {
+                            label: "全天";
+                            checked <=> AppData.editor-all-day;
+                        }
+                    }
+                }
+
+                // ── 自写:滚轮 ──
+                if !AppData.use-native-pickers : HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "时间";
+                        font-size: 13px;
+                        color: Theme.text-dim;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    VCenter {
+                        time-all-day := Toggle {
+                            label: "全天";
+                            checked <=> AppData.editor-all-day;
+                        }
+                    }
+                }
+
+                // 全天任务没有具体时刻(只在当天 09:00 提醒),那就整块收起来,
+                // 免得摆一排点了也没用的滚轮。
+                if !AppData.use-native-pickers && !AppData.editor-all-day : Rectangle {
+                    border-radius: 10px * Theme.radius-scale;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: Theme.card;
+
+                    time-picker := HorizontalLayout {
+                        padding: 4px;
+                        spacing: 0;
+
+                        VCenter {
+                            hour-wheel := WheelColumn {
+                                horizontal-stretch: 1;
+                                kind: 0;
+                                options: AppData.editor-hours;
+                                pos: AppData.hour-wheel-pos;
+                                drag-started(k) => { Logic.begin-wheel-drag(k); }
+                                dragged(k, p) => { Logic.drag-wheel-to(k, p); }
+                                drag-ended(k) => { Logic.end-wheel-drag(k); }
+                                nudged(k, d) => { Logic.nudge-wheel(k, d); }
+                            }
+                        }
+
+                        // 时和分中间的冒号,让它一眼是个时刻而不是两个无关的数字
+                        VCenter {
+                            Text {
+                                text: ":";
+                                font-size: 16px;
+                                font-weight: 600;
+                                color: Theme.text-dim;
+                            }
+                        }
+
+                        VCenter {
+                            minute-wheel := WheelColumn {
+                                horizontal-stretch: 1;
+                                kind: 1;
+                                options: AppData.editor-minutes;
+                                pos: AppData.minute-wheel-pos;
+                                drag-started(k) => { Logic.begin-wheel-drag(k); }
+                                dragged(k, p) => { Logic.drag-wheel-to(k, p); }
+                                drag-ended(k) => { Logic.end-wheel-drag(k); }
+                                nudged(k, d) => { Logic.nudge-wheel(k, d); }
+                            }
+                        }
+                    }
+                }
+                // 提醒:标签单独一行,两排胶囊直接挂在卡片布局下
+                // (套在「标签 + 内层布局」里时胶囊宽度会被算错,溢到卡片外)
+                Text {
+                    text: "提醒";
+                    font-size: 13px;
+                    color: Theme.text-dim;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    for opt[i] in RemindOptions.row1 : Chip {
+                        label: opt;
+                        selected: i == AppData.editor-remind;
+                        clicked => { AppData.editor-remind = i; }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    for opt[i] in RemindOptions.row2 : Chip {
+                        label: opt;
+                        selected: i + RemindOptions.row2-offset == AppData.editor-remind;
+                        clicked => { AppData.editor-remind = i + RemindOptions.row2-offset; }
+                    }
+                }
+
+                Text {
+                    text: AppData.editor-all-day
+                        ? "全天任务在当天 09:00 提醒(忽略「提前多久」)"
+                        : "到点前用系统通知提醒你";
+                    font-size: 11px;
+                    color: Theme.text-dim;
+                    wrap: word-wrap;
+                }
+
+                // 按钮
+                HorizontalLayout {
+                    spacing: 8px;
+                    VCenter {
+                        TextButton {
+                            label: "清除时间";
+                            enabled: AppData.editor-had-due;
+                            clicked => { Logic.clear-due(); }
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    VCenter {
+                        TextButton {
+                            label: "取消";
+                            clicked => { Logic.close-time-editor(); }
+                        }
+                    }
+                    VCenter {
+                        PrimaryButton {
+                            label: "保存";
+                            // 日期由选择器给出,永远合法,所以不用再判空/判格式
+                            clicked => { Logic.save-time-editor(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // ── 内置的日期 / 时刻选择器(Slint 自带的 std-widgets)──
+    //
+    // 它们是 `PopupWindow`,**不是独立的系统窗口** —— 是画在父窗口之上的一层浮层,
+    // 所以 winit 后端也支持(不需要后端去创建真正的 popup 窗口)。
+    //
+    // ⚠️ 配色跟的是 `FluentPalette`(Slint 样式自带的调色板),**吃不到我们那三套主题** ——
+    // 切到工业风/毛玻璃时,弹出来的这个面板仍是系统样式。这是选它换来的代价,
+    // 也正是自写那套(use-native-pickers = false)存在的理由。
+    //
+    // 内置的时刻选择器自带 `close-policy: no-auto-close`,所以两个回调里都得自己 `close()`,
+    // 否则选完它不会收起来。
+    native-date-popup := DatePickerPopup {
+        title: "选择日期";
+        date: {
+            year: AppData.editor-year,
+            month: AppData.editor-month-num,
+            day: AppData.editor-day,
+        };
+        accepted(d) => {
+            Logic.set-editor-date-parts(d.year, d.month, d.day);
+            native-date-popup.close();
+        }
+        canceled => { native-date-popup.close(); }
+    }
+
+    native-time-popup := TimePickerPopup {
+        use-24-hour-format: true;
+        title: "选择时间";
+        time: {
+            hour: AppData.editor-hour,
+            minute: AppData.editor-minute,
+            second: 0,
+        };
+        accepted(t) => {
+            Logic.set-editor-hour(t.hour);
+            Logic.set-editor-minute(t.minute);
+            native-time-popup.close();
+        }
+        canceled => { native-time-popup.close(); }
+    }
+}

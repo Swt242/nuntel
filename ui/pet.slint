@@ -1,0 +1,205 @@
+// 桌宠窗口 —— 独立、透明、置顶、无边框。
+//
+// 几个关键点:
+//
+// 1. **透明窗口只有 software / skia-software 渲染器能做到**,GL 那两个(femtovg /
+//    winit-skia)的 surface 不带 alpha 通道,画出来是一块黑。所以宿主默认用
+//    `winit-skia-software`(见 main.rs 的 SLINT_BACKEND)。
+// 2. **内容贴底**:窗口会随「气泡 / 输入条」出现而变高,贴底之后宠物的脚就不会跳
+//    —— 看起来像从下往上长出来。
+// 3. **拖动不能直接用 TouchArea**:Slint 的 `WindowMoveArea` 才能触发系统级的窗口
+//    移动(带贴靠、拖到屏幕顶最大化),而且它「拖动才移动、单纯点击不移动」,
+//    所以里面的 TouchArea 照样收得到点击。
+// 4. 帧由宿主逐帧推(`pet-frame`),Slint 的 Image 不会自己播动图。
+
+import {
+    AppData, IconButton, Logic, PanelEdge, Theme, VCenter,
+} from "widgets.slint";
+
+export component PetWindow inherits Window {
+    title: "待办清单 · 桌宠";
+    // 初始尺寸而已;实际尺寸由宿主按「气泡/输入条要不要显示」算好再 set_size
+    preferred-width: 220px;
+    preferred-height: 140px;
+    // 无边框 + 透明底;置顶由 always-on-top 交给系统
+    no-frame: true;
+    background: transparent;
+    always-on-top: true;
+    default-font-size: 14px;
+
+    VerticalLayout {
+        // 贴底:窗口变高时,多出来的空间长在上方
+        alignment: end;
+        spacing: 6px;
+
+        // ── 提醒气泡 ──
+        if AppData.pet-bubble != "" : Rectangle {
+            height: 30px;
+            border-radius: 15px * Theme.radius-scale;
+            background: Theme.accent;
+            drop-shadow-color: Theme.shadow;
+            drop-shadow-blur: 14px;
+            drop-shadow-offset-y: 4px;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                Text {
+                    text: AppData.pet-bubble;
+                    font-size: 12px;
+                    color: Theme.accent-fg;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+            }
+
+            // 点气泡 = 知道了
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { Logic.acknowledge-reminders(); }
+            }
+        }
+
+        // ── 快速添加输入条(点宠物展开)──
+        if AppData.pet-adding : Rectangle {
+            height: 36px;
+            border-radius: 10px * Theme.radius-scale;
+            // 用 sheet 不用 card:它压在桌面/其它窗口上,太透会看不清字
+            background: Theme.sheet;
+            border-width: 1px;
+            border-color: Theme.accent-ink;
+            drop-shadow-color: Theme.shadow;
+            drop-shadow-blur: 16px;
+            drop-shadow-offset-y: 4px;
+
+            PanelEdge { width: parent.width - 2px; }
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 4px;
+                spacing: 4px;
+
+                pet-input := TextInput {
+                    text <=> AppData.pet-draft;
+                    color: Theme.text;
+                    font-size: 13px;
+                    single-line: true;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    init => { self.focus(); }
+                    accepted => { Logic.add-quick-task(AppData.pet-draft); }
+                    // 只接管 Esc;其余按键必须 reject,否则输入法/编辑键会被吃掉
+                    key-pressed(ev) => {
+                        if (ev.text == Key.Escape) {
+                            Logic.toggle-pet-input();
+                            accept
+                        } else {
+                            reject
+                        }
+                    }
+                }
+
+                VCenter {
+                    pet-add := IconButton {
+                        icon: @image-url("icons/plus.svg");
+                        icon-size: 15px;
+                        enabled: !AppData.pet-draft.is-empty;
+                        clicked => { Logic.add-quick-task(AppData.pet-draft); }
+                    }
+                }
+            }
+
+            // 占位提示:空且没聚焦时自己画一个(TextInput 没有 placeholder)
+            if AppData.pet-draft.is-empty && !pet-input.has-focus : Text {
+                text: "记一笔…";
+                color: Theme.text-dim;
+                font-size: 13px;
+                x: 10px;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+
+        // ── 宠物本体 ──
+        Rectangle {
+            height: AppData.pet-size * 1px;
+            background: transparent;
+
+            HorizontalLayout {
+                alignment: center;
+
+                pet-body := Rectangle {
+                    width: AppData.pet-size * 1px;
+                    height: AppData.pet-size * 1px;
+                    background: transparent;
+
+                    // **这里不能用 WindowMoveArea**(踩过的坑:桌宠死活拖不动)。
+                    // 它靠 `input_event_filter_before_children` 拿到按下,而之后的
+                    // Moved 只发给「按下时抓住鼠标的那个元素」及其祖先 —— 宠物身上
+                    // 必须有个 TouchArea 接单击/双击,按下会被它抓走,于是
+                    // WindowMoveArea 再也收不到 Moved,`start_window_move()` 永远不触发。
+                    // (对照:主窗口标题栏没有 TouchArea,所以那边一直好使。)
+                    //
+                    // 拖动改由宿主算:按下时记下「指针 + 窗口」的全局位置,拖动时按指针
+                    // 的**全局**位移挪窗口。不能用 mouse-x 那类窗口内坐标 —— 窗口跟着
+                    // 指针走,窗口内的相对位置根本不变。
+                    Image {
+                        source: AppData.pet-frame;
+                        width: parent.width;
+                        height: parent.height;
+                    }
+
+                    // 未完成数角标。贴在右上角、允许溢出边界 —— clip 默认是关的,正好。
+                    if AppData.pet-count > 0 : Rectangle {
+                        width: badge-text.width + 12px;
+                        height: 20px;
+                        border-radius: 10px * Theme.radius-scale;
+                        background: Theme.danger;
+                        // 白色细环而不是 Theme.bg:窗口是透明的,
+                        // 拿不透明的主题底色描边会凭空出现一圈方块
+                        border-width: 2px;
+                        border-color: #ffffffd9;
+                        x: parent.width - self.width + 6px;
+                        y: -4px;
+
+                        badge-text := Text {
+                            text: AppData.pet-count > 99 ? "99+" : "\{AppData.pet-count}";
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            x: 6px;
+                            y: (parent.height - self.height) / 2;
+                        }
+                    }
+
+                    // 单击 / 双击 / 拖动都归它。拖动**不会**顺带触发 clicked:
+                    // TouchArea 的 clicked 只在「按下和松开都在本区域内」时发,
+                    // 真拖起来之后窗口跟着指针走,松手时指针还在宠物上——
+                    // 所以这道判断交给宿主(见 State::pet_just_dragged)。
+                    pet-touch := TouchArea {
+                        mouse-cursor: pointer;
+
+                        changed pressed => {
+                            if (self.pressed) {
+                                // mouse-x/y 是相对本 TouchArea 的,加上它在窗口里的
+                                // 绝对位置,才是宿主能用来和窗口坐标相加的基准点
+                                Logic.pet-drag-begin(
+                                    pet-body.absolute-position.x + self.mouse-x,
+                                    pet-body.absolute-position.y + self.mouse-y,
+                                );
+                            } else {
+                                Logic.pet-drag-end();
+                            }
+                        }
+                        moved => { Logic.pet-drag-slide(); }
+                        double-clicked => { Logic.show-main-window(); }
+                        clicked => { Logic.toggle-pet-input(); }
+                    }
+                }
+            }
+        }
+    }
+}

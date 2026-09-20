@@ -1,0 +1,1025 @@
+// 共享的东西:设计令牌(Theme)、和 Rust 之间的状态契约(AppData / Logic)、
+// 以及几个小控件。日历视图和主窗口都从这里 import。
+//
+// ⚠️ **全局单例不跨窗口共享**。Slint 文档原话:"Global singletons aren't shared
+// between separate windows. You may need to initialize the global callbacks and
+// properties for each instance you create."
+// 也就是说主窗口和设置窗口各有一份 Theme / AppData / Logic 实例 ——
+// 宿主改了主窗口那份,设置窗口那份不会跟着变。加窗口时记得**两边都要推、回调也要两边都接**,
+// 漏掉的表现是「设置窗口里的东西不跟着主题变」。宿主侧统一走 State::push_theme()。
+
+import { Palette } from "std-widgets.slint";
+
+// ── 枚举与结构 ────────────────────────────────────────────────────────
+
+export enum Filter { all, active, completed }
+export enum ThemePreference { system, light, dark }
+export enum View { list, calendar, week }
+
+/// 界面外观。跟亮暗是两个独立的维度,一共 3×2 种组合。
+///
+/// - `solid`:原来那套不透明的实心配色
+/// - `glass`:毛玻璃(半透明面板 + 彩色网格底衬)
+/// - `industrial`:工业风(全直角 + 发丝线 + 纸墨中性色 + 信号黄,下详)
+export enum Appearance { solid, glass, industrial }
+
+/// 「提前多久提醒」下拉的档位。界面里用 int 索引,宿主再翻译成分钟数:
+/// 0 不提醒 / 1 准点 / 2 提前 5 分 / 3 提前 15 分 / 4 提前 30 分 / 5 提前 1 小时 / 6 提前 1 天
+export global RemindOptions {
+    // 7 档拆成两排显示(卡片放不下 7 个)。用两个数组而不是一个数组加
+    // visible 过滤 —— Slint 布局里 invisible 的元素**照样占位**,会把后面的挤出去。
+    // 索引含义:0 不提醒 / 1 准点 / 2 提前 5 分 / 3 提前 15 分 /
+    //          4 提前 30 分 / 5 提前 1 小时 / 6 提前 1 天
+    // (Rust 侧 remind_minutes() 是权威映射,这里只管显示)
+    out property <[string]> row1: ["不提醒", "准点", "5 分钟", "15 分钟"];
+    out property <[string]> row2: ["30 分钟", "1 小时", "1 天"];
+    /// 第二排的第一个胶囊对应的索引
+    out property <int> row2-offset: 4;
+}
+
+export struct TodoItem {
+    id: int,
+    title: string,
+    done: bool,
+    // 时间徽标(空 = 不显示)
+    badge: string,
+    overdue: bool,
+    // 是否处于「提醒未确认」的高亮状态
+    alerting: bool,
+}
+
+/// 日历里的一格
+export struct DayCell {
+    date: string,          // "2026-09-18"
+    day: int,              // 18
+    in-month: bool,        // 是不是本月
+    is-today: bool,
+    is-selected: bool,
+    overdue: bool,         // 这天有逾期未完成的
+    count: int,            // 当天任务总数(格子小的时候只显示这个数)
+    sub: string,           // 日期下面那行小字:节日名,没有就是农历
+    is-festival: bool,     // 小字是节日 → 用强调色
+    is-work: bool,         // 调休上班日
+    rest: bool,            // 休息日(周末或法定假日),格子底色压暗一档
+    line1: string,
+    line1-done: bool,
+    line2: string,
+    line2-done: bool,
+    more: int,             // 还有几条没显示
+}
+
+/// 时间浮层里那个月历的一格。
+///
+/// 比 `DayCell` 轻得多 —— 只用来选日期,不需要列任务,所以没必要把任务数据也搬过来。
+export struct PickerDay {
+    date: string,          // "2026-09-18"
+    day: int,              // 18
+    in-month: bool,
+    is-today: bool,
+    is-selected: bool,
+    rest: bool,            // 周末或法定假日,底色压暗一档
+}
+
+/// 一个桌宠动画(设置窗口里一行)。
+///
+/// `name` 是素材里的名字(`idle-1` / `read` …),回调按它找回宿主那份配置 ——
+/// 不能靠下标:宿主和 UI 各持一份列表,顺序虽然一样,但用名字更抗折腾。
+export struct PetAnim {
+    name: string,
+    /// 给人看的中文名(Rust 侧的 PET_ANIM_LABELS)。没配到就是原名。
+    label: string,
+    /// 速度倍率,1 = 素材原始速度
+    speed: float,
+}
+
+/// 时刻选择器里的一个数字块(时或分)。
+///
+/// `label` 由宿主补零格式化("00" "05"),不在 .slint 里拼字符串 ——
+/// Slint 的字符串拼接没有补零能力,硬拼出来会是 "5" 而不是 "05"。
+export struct TimeOption {
+    value: int,            // 0-23 或 0-59
+    label: string,
+}
+
+/// 周视图里的一格 = 一天
+export struct WeekDay {
+    date: string,          // "2026-09-18"
+    /// "9 月 18 日 周五"
+    label: string,
+    /// 农历或节日名
+    sub: string,
+    is_today: bool,
+    rest: bool,            // 休息日
+    work: bool,            // 调休上班
+    is_festival: bool,
+    /// 当天任务总数(格子放不下时靠它提示还有多少)
+    count: int,
+    /// 当天任务
+    tasks: [TodoItem],
+}
+
+// ── 设计令牌 ──────────────────────────────────────────────────────────
+
+// ── 毛玻璃(glassmorphism)─────────────────────────────────────────────
+//
+// 配方照搬 web 上通行的做法:一张有色斑的底 + 一层层半透明的玻璃。
+// 玻璃面板由四样东西凑成,缺一样都会「不像玻璃」:
+//
+//   1. 半透明填充(rgba 白 8%~15% 暗色下 / 55%~72% 亮色下)
+//   2. 发丝描边 —— 1px、很淡的白,模拟玻璃边缘接住光
+//   3. 顶部高光 —— web 里的 `inset 0 1px 0 rgba(255,255,255,.35)`,见 PanelEdge
+//   4. 柔和投影 —— 让面板浮起来
+//
+// web 版还有一条 `backdrop-filter: blur(16px) saturate(180%)`,**这条在本项目里没有对应物**:
+// Slint 语言没有模糊滤镜(编译器里搜不到任何 blur 原语),窗口也没法透到桌面
+// (根因见 docs/calendar-reminders.md §16)。所以这里换了条路 ——
+// 底下那层不放照片/纯色,而是放**本来就是糊的**径向渐变色斑(见 Backdrop):
+// 模糊一张已经糊的图等于没模糊,于是「缺的那一步」在观感上就不成立了。
+//
+// 唯一真的要小心的:文字不要放在过透的底上。半透明面板没有固定对比度,
+// 所以卡片比「装饰性表面」更实一点点,正文一律用满不透明的 text 色。
+// 令牌的写法:`glass ? (glass 的暗/亮) : (solid 的暗/亮)`。
+// 每个令牌都要在 2×2 四种组合下成立 —— 加令牌时别只顾着一半。
+//
+// 有几个令牌在 solid 下刻意给成 `transparent`(panel-edge / shadow / blob-*)。
+// 这不是省事,是**为了让装饰层自动失效**:PanelEdge 和各个面板的 drop-shadow-*
+// 都无条件挂在界面上,靠「画出来是透明的」来关掉,不用在几十处加 `if glass`。
+export global Theme {
+    in property <ThemePreference> preference: ThemePreference.system;
+    /// 由宿主推过来(AppData / Theme 都是**每个窗口一份**,见下)
+    in property <Appearance> appearance: Appearance.glass;
+
+    out property <bool> dark:
+        preference == ThemePreference.dark ? true
+        : (preference == ThemePreference.light ? false
+        : Palette.color-scheme == ColorScheme.dark);
+
+    out property <bool> glass: appearance == Appearance.glass;
+    out property <bool> industrial: appearance == Appearance.industrial;
+
+    // 圆角倍率。工业风压成 0 = 全直角。
+    //
+    // 这是工业风和另外两套**最关键的区别**,也是唯一一处必须逐个尺寸乘一遍的地方:
+    // 界面上有三十来处 `border-radius`,没有「全局圆角」这种东西可以改,
+    // 所以统一写成 `N px * Theme.radius-scale`。新加圆角时记得乘上。
+    // (形状本身就是圆的元素不乘 —— 比如逾期状态那种 5px 小圆点,见 calendar.slint。)
+    out property <float> radius-scale: industrial ? 0.0 : 1.0;
+
+    // 底色(glass 下色斑、industrial 下网格画在这上面,见 Backdrop)
+    out property <color> bg:
+        industrial ? (dark ? #101110 : #e8e8e2)
+        : glass    ? (dark ? #080b16 : #c9d5f2)
+        :            (dark ? #0f1115 : #eef0f4);
+
+    // 色斑:三团柔光。只给「中心色 + 带 alpha」,衰减在 Backdrop 里做。
+    //
+    // 这是整个毛玻璃的地基,别调淡:玻璃是半透明的,底下透上来的颜色有多足,
+    // 它就有多像玻璃。底色一旦发灰发白,所有面板会一起塌成一片糊白
+    // (第一版就栽在这 —— 面板没动,只是底下没颜色)。
+    // 亮色主题尤其吃色,因为它上面还压着一层偏白的玻璃。
+    // 暗色下的色斑要比亮色**淡一点但更饱和**:底下是深色,同样的叠加量看着更沉,
+    // 但也不能太淡 —— 淡了就只剩一片黑,玻璃透上来还是黑。
+    //
+    // 非 glass 一律给 transparent:Backdrop 照画,但什么都画不出来,底衬自动变素。
+    out property <color> blob-a:
+        glass ? (dark ? #7c5cff94 : #8b5cf6cc) : transparent;
+    out property <color> blob-b:
+        glass ? (dark ? #22d3ee80 : #0ea5e9a6) : transparent;
+    out property <color> blob-c:
+        glass ? (dark ? #f472b680 : #ec489999) : transparent;
+
+    // 工业风的背景网格:CAD 图纸那种淡淡的坐标格。
+    // 主线每 5 格一根,颜色重一档 —— 只有一种线的话看起来像屏幕脏了。
+    out property <color> grid-line:
+        industrial ? (dark ? #1a1d1a : #dcdcd6) : transparent;
+    out property <color> grid-line-major:
+        industrial ? (dark ? #242824 : #cbcac3) : transparent;
+
+    // 表面:card 是抬起来的,inset 是凹下去的。
+    // 玻璃的亮色下白只给 46% —— 再多就把底色盖死,面板退化成一块白塑料。
+    // 工业风不透明:纸(亮)/墨(暗)是主体,面板就是比底色亮一档的纸。
+    out property <color> card:
+        industrial ? (dark ? #181a18 : #f2f2ec)
+        : glass    ? (dark ? #ffffff26 : #ffffff75)
+        :            (dark ? #1a1d24 : #ffffff);
+    out property <color> inset:
+        industrial ? (dark ? #0b0d0b : #dcdcd6)
+        : glass    ? (dark ? #00000047 : #0f172a1a)
+        :            (dark ? #171b23 : #e5e8ee);
+    out property <color> hover:
+        industrial ? (dark ? #212420 : #ffffff)
+        : glass    ? (dark ? #ffffff2e : #ffffffb3)
+        :            (dark ? #242833 : #eef1f5);
+
+    // 浮层专用:几乎不透明。
+    //
+    // 这是玻璃唯一「半透明会坏事」的地方。web 上浮层背后有 backdrop-filter
+    // 把底下的东西糊掉,所以可以用很透的玻璃;这里没有模糊,浮层一旦够透,
+    // 底下的任务标题就会清晰地穿过浮层和自己的文字叠在一起 ——
+    // 那读起来不是「毛玻璃」,是「字压字」。宁可在这里牺牲玻璃感换可读性。
+    // (另外两套本来就是不透明的,沿用各自的 card 色即可。)
+    out property <color> sheet:
+        industrial ? (dark ? #181a18 : #f2f2ec)
+        : glass    ? (dark ? #1b2130f5 : #ffffffeb)
+        :            (dark ? #1a1d24 : #ffffff);
+
+    // 描边:发丝级。
+    // - 玻璃亮色下是一条「白到发亮」的边,但白边在浅底上没有轮廓感,
+    //   真正勾勒形状的是投影(见各处的 drop-shadow-*);
+    // - 玻璃暗色下反过来,描边是主要的形状来源;
+    // - 工业风**只有描边**,没有投影 —— 形状全靠线,这就是工程图纸的做法。
+    out property <color> border:
+        industrial ? (dark ? #343633 : #d8d9d5)
+        : glass    ? (dark ? #ffffff26 : #ffffffd9)
+        :            (dark ? #2a2f3a : #e2e6ec);
+    // 重规线:需要比发丝线更明确的分隔(当前用于输入框的未聚焦态等)
+    out property <color> border-strong:
+        industrial ? (dark ? #4a4d49 : #b6b8b3)
+        : glass    ? (dark ? #ffffff59 : #94a3b8)
+        :            (dark ? #434a58 : #c3c9d4);
+
+    // 面板顶边那道线(见 PanelEdge 组件)。
+    // - 玻璃:两端渐隐的白高光;
+    // - 工业:**信号黄**的短横,这是整套工业风里最显眼的一处强调色用法 ——
+    //   它只出现在面板顶边这一条 1px 上,不铺任何面积;
+    // - 原主题:transparent,等于不存在。
+    out property <color> panel-edge:
+        industrial ? (dark ? #fff50080 : #6f600099)
+        : glass    ? (dark ? #ffffff6b : #ffffff)
+        :            transparent;
+
+    // 投影。非 glass 一律 transparent = 各处的 drop-shadow-* 自动不画。
+    // 工业风尤其要关掉:它靠线不靠影,加投影立刻就"软"了。
+    out property <color> shadow:
+        glass ? (dark ? #00000073 : #1e2a444d) : transparent;
+
+    // 正文色。玻璃面板没有固定对比度,所以正文一律用满不透明的深色。
+    // 工业风用的是"纸白"而不是纯白(暗色下)、"墨黑"而不是纯黑(亮色下)。
+    out property <color> text:
+        industrial ? (dark ? #e8e8e2 : #191919)
+        : glass    ? (dark ? #eef2fb : #10162a)
+        :            (dark ? #e7eaf0 : #16191f);
+    out property <color> text-dim:
+        industrial ? (dark ? #8a8d86 : #6b6e68)
+        : glass    ? (dark ? #9aa4b8 : #4a5670)
+        :            (dark ? #838b99 : #858c98);
+
+    // ── 强调色:拆成「填充」和「墨」两种角色 ──
+    //
+    // 为什么必须拆:工业风的信号黄是高亮度色,**当填充很好用,当文字没法看**。
+    // 亮色(纸)模式下尤其致命 —— 黄字压纸上对比度只有 1.7:1,等于没有。
+    // 而另外两套(蓝)两种角色用同一个值就够,所以它们的 accent-ink == accent。
+    //
+    //   accent      填充:复选框、徽标、选中胶囊、主按钮的**底**
+    //   accent-ink  墨迹:文字、图标、描边、焦点框
+    //
+    // 工业风亮色下 ink 用墨黑:纸墨是主体,「选中」这件事靠墨色表达,
+    // 黄色只留给填充 —— 这正是"强调色只是信号,不做大面积主体"的落地方式。
+    out property <color> accent:
+        industrial ? (dark ? #fff500 : #fff500)   // 谷地黄(信号黄)
+        : #3b74f2;
+    // 亮色下不能用纯信号黄(#fff500 压纸上对比度只有 1.7:1,等于没有),
+    // 也不能退回墨黑 —— 那样"信号"就跟正文一个颜色了,强调色等于失效。
+    // 折中成一支**深金** #6f6000:对纸 4.8:1 够读,又明显是"黄色的那一支",
+    // 和暗色下的信号黄、以及各处黄色填充是同一个色系。
+    out property <color> accent-ink:
+        industrial ? (dark ? #fff500 : #6f6000)
+        : #3b74f2;
+    // 压在强调色**填充**上的前景色。黄色底上必须是深色字,用白字看不清。
+    out property <color> accent-fg:
+        industrial ? #101110 : #ffffff;
+    // 强调色的淡填充。工业风下要克制:它是"被选中"的一层薄雾,
+    // 不是背景色 —— 调研里明确警告过"长文字背后铺施工黄"。
+    out property <color> accent-soft:
+        industrial ? (dark ? #fff5001f : #fff50059)
+        : glass    ? (dark ? #3b74f23d : #3b74f224)
+        :            (dark ? #1b2947 : #e9f0ff);
+    // 语义色不参与配色切换(错误/成功/警告是固定的)
+    out property <color> danger:
+        industrial ? (dark ? #ff6b61 : #ff3b30)
+        : glass    ? (dark ? #ff8078 : #d94742)
+        :            (dark ? #ff7a72 : #d94742);
+    // 浮层遮罩:web 上这层本来有 backdrop-filter 把背后糊掉,所以可以用得很淡;
+    // 这里没有模糊,只能盖重一点,否则背后的内容会跟浮层抢注意力。
+    out property <color> scrim:
+        industrial ? (dark ? #000000cc : #00000066)
+        : glass    ? (dark ? #05070fcc : #0d142a80)
+        :            (dark ? #00000099 : #00000044);
+}
+
+// ── 宿主推给 UI 的状态 ────────────────────────────────────────────────
+
+export global AppData {
+    // 清单
+    in property <[TodoItem]> todos;          // 已按 filter 过滤好的列表
+    in property <Filter> filter: Filter.all;
+    in property <int> remaining: 0;
+    in property <int> completed: 0;
+    in property <int> editing-id: -1;
+    in-out property <string> edit-text;
+    in-out property <string> draft;
+
+    // 视图切换
+    in-out property <View> view: View.list;
+
+    // 日历
+    in property <[DayCell]> days;             // 42 格(6 周 × 7 天)
+    in property <string> month-label;         // "2026 年 9 月"
+    in property <[TodoItem]> day-todos;       // 选中那天的任务
+    in property <[WeekDay]> week-days;        // 周视图:7 天,每天带自己的任务列表
+    /// 周视图每格的高度(px)。由 Rust 按真实窗口高度算好推过来 ——
+    /// 实测靠布局的 stretch 分不到空间,不如直接算,结果可控。
+    in property <float> week-card-height: 46;
+    in property <string> week-label;          // "9 月 15 日 – 9 月 21 日"
+    in property <string> selected-label;      // "9 月 18 日 · 今天"
+    in property <int> selected-day-count: 0;
+
+    // 时间设置浮层
+    in property <int> editor-id: -1;          // -1 = 关闭
+    in property <string> editor-title;        // 浮层上显示的任务名
+    in property <bool> editor-had-due: false; // 本来有没有时间(决定「清除时间」能不能点)
+    in-out property <bool> editor-all-day;    // 全天开关由 UI 持有(跟 Toggle 双向绑定)
+    in-out property <int> editor-remind: 3;   // RemindOptions 的索引
+
+    // ── 日期选择器 ──
+    // 日期/时刻**没有对应的文本输入了**,全部由这里点选 ——
+    // 以前那两个 TextInput 用户能打出「2026-13-45」这种,选择器从源头堵掉了。
+    in property <[PickerDay]> editor-days;    // 当前显示月份的 42 格
+    in property <string> editor-month-label;  // "2026 年 9 月"
+    in property <string> editor-date-label;   // "9 月 18 日 周四",显示当前选中的那天
+
+    // ── 时刻选择器 ──
+    in property <int> editor-hour: 9;
+    in property <int> editor-minute: 0;
+    /// 两个滚轮当前停在哪个浮点位置(单位:格)。
+    ///
+    /// **位置由宿主持有**,不是滚轮自己管 —— 因为惯性滑动必须按时间积分,
+    /// 而 Slint 语言读不到时钟(估不出速度,也没法逐帧推进)。所以:
+    /// 拖动时滚轮把目标位置报给宿主,宿主夹好范围立刻推回来(同线程同步调用,
+    /// 不经过事件循环,所以没有延迟);松手后宿主按阻尼模型逐帧推。
+    in property <float> hour-wheel-pos: 0;
+    in property <float> minute-wheel-pos: 0;
+    in property <[TimeOption]> editor-hours;   // 0-23
+    in property <[TimeOption]> editor-minutes; // 0-59
+
+    // ── 内置选择器(Slint 自带的 DatePickerPopup / TimePickerPopup)──
+    //
+    // 两套实现都留着,靠 `use-native-pickers` 切:
+    //   true  = 用 std-widgets 内置的(表盘式,成熟;但配色跟的是 FluentPalette,
+    //           不吃我们这三套主题,见 docs §20)
+    //   false = 用自己写的滚轮(WheelColumn,配色跟主题完全一致)
+    // 开关由宿主的一个常量推过来,想切回去改那一个常量就行。
+    in property <bool> use-native-pickers: false;
+    /// 内置的日期选择器要的是 `Date { year, month, day }` 三个整数,
+    /// 所以除了 `editor-date-label` 之外还得单独推一份拆开的
+    in property <int> editor-year: 2026;
+    in property <int> editor-month-num: 1;
+    in property <int> editor-day: 1;
+    /// "09:30",给内置时刻选择器的入口按钮当文案
+    in property <string> editor-time-label;
+
+    // 提醒横幅
+    in property <int> pending-count: 0;
+    in property <string> pending-title;
+
+    // 设置
+    in property <bool> autostart: false;
+
+    /// 窗口是不是最大化(决定标题栏那个按钮画方块还是两个方块)
+    in property <bool> maximized: false;
+
+    /// 窗口矮的时候日历格子只报数量。由 Rust 按真实窗口尺寸推过来 ——
+    /// 不能在 .slint 里用 self.height 算,那会和布局互相牵扯成绑定环。
+    in property <bool> compact-cells: false;
+
+    // ── 桌宠窗口 ──
+    //
+    // 桌宠是**独立窗口**,所以这些属性在它那边也各有一份实例
+    // (全局单例不跨窗口共享,见文件头)。宿主必须单独推。
+    /// 当前这一帧的图。动图由宿主逐帧推 —— Slint 的 Image 是静态的,不会自己播。
+    in property <image> pet-frame;
+    /// 宠物显示边长(px)。范围见 Rust 侧的 PET_SIZE_MIN/MAX
+    in property <float> pet-size: 112;
+    /// 所有动画,每个带自己的速度倍率(设置窗口里一行一个滑杆)
+    in property <[PetAnim]> pet-anims;
+    /// 未完成数,角标上显示;0 就不显示角标
+    in property <int> pet-count: 0;
+    /// 提醒气泡的文字,空 = 不显示
+    in property <string> pet-bubble;
+    /// 是不是展开了「快速添加」输入条
+    in property <bool> pet-adding: false;
+    in-out property <string> pet-draft;
+}
+
+// ── UI 回调宿主的动作 ─────────────────────────────────────────────────
+
+export global Logic {
+    // 任务
+    callback add-task(string);
+    callback toggle-task(int);
+    callback remove-task(int);
+    callback toggle-all();
+    callback clear-completed();
+    callback set-filter(Filter);
+    callback begin-edit(int);
+    callback commit-edit(string);
+    callback cancel-edit();
+    callback cycle-theme();
+    // 视图 / 日历
+    callback set-view(View);
+    callback shift-month(int);
+    callback shift-week(int);   // 周视图翻周,±1
+    callback goto-today();
+    callback select-day(string);
+    callback toggle-day-task(int);
+    // 时间浮层
+    callback open-time-editor(int);
+    callback close-time-editor();
+    /// 不用传参:日期/时刻都由宿主持有,「全天」和「提醒」宿主自己回读。
+    /// (以前要传四个参数,是因为日期和时刻是用户在文本框里敲的,宿主不知道。)
+    callback save-time-editor();
+    callback clear-due();
+    callback set-editor-day(int);   // 0 = 今天,1 = 明天
+    callback shift-editor-month(int);
+    callback pick-editor-day(string);   // 传 "YYYY-MM-DD"
+    callback set-editor-hour(int);
+    callback set-editor-minute(int);
+    // ── 滚轮拖动:位置归宿主管,这里只上报「手指把它拖到哪了」 ──
+    /// kind: 0 = 时,1 = 分
+    callback begin-wheel-drag(int);
+    callback drag-wheel-to(int, float);
+    /// 松手。宿主在这里接手做惯性滑动
+    callback end-wheel-drag(int);
+    /// 鼠标滚轮拨一格。**故意不走拖动那套**:拨一格就是「值 ±1」,
+    /// 跟位置、速度、惯性都没关系。之前让它假扮成一次拖动,结果漏了
+    /// `drag-started` 就整个失灵了 —— 不如给它一条自己的路。
+    /// kind: 0 = 时,1 = 分;delta: ±1
+    callback nudge-wheel(int, int);
+    /// 内置日期选择器回来的是 `Date { year, month, day }`,一次给三个
+    callback set-editor-date-parts(int, int, int);
+    // 提醒
+    callback acknowledge-reminders();
+    // 设置
+    callback set-autostart(bool);
+    callback set-appearance(Appearance);
+    /// 打开设置窗口(已经在开着就把它叫到前面)
+    callback open-settings();
+    /// 关掉设置窗口(只是隐藏,窗口留着下次直接显示)
+    callback close-settings();
+
+    // ── 桌宠 ──
+    /// 点一下宠物:展开 / 收起快速添加输入条
+    callback toggle-pet-input();
+    /// 从桌宠直接加一条任务(不带日期)
+    callback add-quick-task(string);
+    /// 双击宠物:把主窗口叫到前台
+    callback show-main-window();
+    /// 拖动桌宠:按下 / 拖动中 / 松开。
+    ///
+    /// 为什么不用内置的 `WindowMoveArea`:它靠 `input_event_filter_before_children`
+    /// 拿到按下,后续的 Moved 只发给「按下时抓住鼠标的那个元素」及其祖先 ——
+    /// 而宠物身上必须有一个 TouchArea 来接单击/双击,按下会被它抓走,
+    /// WindowMoveArea 便再也收不到 Moved,`start_window_move()` 永远不触发
+    /// (实测:主窗口标题栏能拖,桌宠死活拖不动)。所以拖动改由宿主算:
+    /// 按下记下「指针 + 窗口」的位置,拖动时按指针的全局位移 `set_position`。
+    /// 参数是按下点在**窗口内**的坐标(x, y)。
+    ///
+    /// 为什么不干脆在宿主里轮询指针:`changed pressed` 被处理时,指针可能已经
+    /// 又动了几像素(实测合成拖动下能差 20px),基准点就偏了 —— 一按下去宠物会
+    /// 跳一下。用事件里带的位置才准。
+    callback pet-drag-begin(length, length);
+    callback pet-drag-slide();
+    callback pet-drag-end();
+    /// 设置里调桌宠大小(像素边长)。宿主会 clamp 到合法范围再存盘。
+    callback set-pet-size(float);
+    /// 设置里调**某个**桌宠动画的速度(按动画名找回那一条)
+    callback set-pet-anim-speed(string, float);
+
+    // 无边框窗口的标题栏
+    callback toggle-maximize();
+    callback minimize-window();
+    callback hide-window();
+}
+
+// ── 小控件 ────────────────────────────────────────────────────────────
+
+/// 面板顶边那一条线。三套外观各长各的,颜色全由 `Theme.panel-edge` 决定:
+///
+/// - **毛玻璃**:两端渐隐的白高光。web 配方里是
+///   `box-shadow: inset 0 1px 0 rgba(255,255,255,.35)`。注意是渐隐到
+///   **同色 alpha=0**,不是渐隐到 transparent 黑 —— 后者会在地上留一道灰边
+///   (Slint 的 mix 是按 alpha 加权的,同色淡出才干净)。
+/// - **工业风**:一根信号黄的短横。这是整套工业风里最显眼的一处强调色 ——
+///   它只占面板顶边这 1px,不铺任何面积,正合「强调色只是信号」。
+///   黄线的两端**也**是渐隐的:直角几何里横平竖直已经够硬,线再齐头齐尾就发死。
+/// - **原主题**:transparent,等于不存在。
+///
+/// 用法:直接当成面板的一个子元素放进去,宽度自己给 ——
+/// `PanelEdge { width: parent.width - 2px; }`。
+/// 不能放进布局里(它写了 x/y,Slint 不允许布局子元素自己定位),
+/// 也不能在组件内部读 `parent`(组件根元素访问不到,只能由调用方传)。
+/// 定义必须排在使用它的组件前面,Slint 是顺序解析的。
+export component PanelEdge inherits Rectangle {
+    x: 1px;
+    y: 1px;
+    height: 1px;
+    background: @linear-gradient(
+        90deg,
+        Theme.panel-edge.with-alpha(0) 0%,
+        Theme.panel-edge 16%,
+        Theme.panel-edge 84%,
+        Theme.panel-edge.with-alpha(0) 100%,
+    );
+}
+
+// 布局默认把固定高度的子元素贴顶对齐(布局的 alignment 管的是主轴)。
+// 尺寸写死的控件放进这个里,才能在行内垂直居中。
+export component VCenter inherits VerticalLayout {
+    alignment: center;
+    @children
+}
+
+export component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <length> icon-size: 16px;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    in property <float> disabled-opacity: 0.32;
+    // 自己的悬停态:悬停时鼠标在按钮上,父级可能收不到 has-hover,
+    // 所以要把这个暴露出去给调用方判断
+    out property <bool> hovered: touch.has-hover;
+
+    callback clicked();
+
+    width: 30px;
+    height: 30px;
+    border-radius: 8px * Theme.radius-scale;
+    opacity: enabled ? 1 : disabled-opacity;
+    background: (enabled && touch.has-hover)
+        ? (danger ? Theme.danger.with-alpha(0.14) : Theme.hover)
+        : transparent;
+
+    animate background { duration: 120ms; }
+    animate opacity { duration: 120ms; }
+
+    Image {
+        source: root.icon;
+        width: root.icon-size;
+        height: root.icon-size;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        colorize: danger ? Theme.danger : Theme.text-dim;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+}
+
+export component TextButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+
+    callback clicked();
+
+    height: 30px;
+    border-radius: 8px * Theme.radius-scale;
+    opacity: enabled ? 1 : 0.4;
+    background: (enabled && touch.has-hover) ? Theme.hover : transparent;
+
+    animate background { duration: 120ms; }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        Text {
+            text: root.label;
+            color: Theme.text-dim;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+}
+
+export component FilterTab inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected: false;
+
+    callback clicked();
+
+    border-radius: 7px * Theme.radius-scale;
+    background: selected ? Theme.card
+        : (touch.has-hover ? Theme.card.with-alpha(0.5) : transparent);
+
+    animate background { duration: 150ms; }
+
+    // 选中的那块是「浮起来」的玻璃,给一道顶部高光。
+    // 这里用 opacity 开关而不是 `if selected:` —— 条件元素会插一层隐式父级,
+    // 里面的 `parent` 就不一定还指向本组件了。
+    PanelEdge {
+        width: parent.width - 2px;
+        opacity: selected ? 1 : 0;
+    }
+
+    Text {
+        text: root.label;
+        color: selected ? Theme.text : Theme.text-dim;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component TodoCheck inherits Rectangle {
+    in property <bool> checked: false;
+
+    callback toggled();
+
+    width: 22px;
+    height: 22px;
+    border-radius: 7px * Theme.radius-scale;
+    border-width: 2px;
+    border-color: checked ? Theme.accent-ink
+        : (touch.has-hover ? Theme.accent-ink : Theme.border-strong);
+    background: checked ? Theme.accent
+        : (touch.has-hover ? Theme.accent-soft : transparent);
+
+    animate background { duration: 150ms; }
+    animate border-color { duration: 150ms; }
+
+    if checked : Image {
+        source: @image-url("icons/check.svg");
+        width: 14px;
+        height: 14px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        colorize: Theme.accent-fg;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+    }
+}
+
+/// 带文字的勾选开关(设置项用)。不用 std-widgets 的 CheckBox 是因为
+/// 它跟的是系统 Palette,本应用手动切暗色时它会突兀地发白。
+export component Toggle inherits Rectangle {
+    in property <string> label;
+    in-out property <bool> checked: false;
+
+    callback toggled();
+
+    height: 22px;
+    width: layout.preferred-width;
+    background: transparent;
+
+    // 整块都能点:点文字也切换,不然只有那 22px 的小方块生效
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled();
+        }
+    }
+
+    layout := HorizontalLayout {
+        spacing: 7px;
+
+        TodoCheck {
+            checked: root.checked;
+            // 点在方块上时事件被内层 TouchArea 吃掉,在这里跟着翻
+            toggled => {
+                root.checked = !root.checked;
+                root.toggled();
+            }
+        }
+
+        Text {
+            text: root.label;
+            font-size: 13px;
+            color: Theme.text;
+            vertical-alignment: center;
+        }
+    }
+}
+
+/// 自定义滑杆。
+///
+/// 为什么不用 std-widgets 的 `Slider`:它跟的是 `FluentPalette`(系统调色板),
+/// 本应用手动切暗色/工业风时它会突兀地弹出一块浅色控件(同样的原因让我们
+/// 放弃了内置的 CheckBox / DatePicker)。自己画才跟得上三套外观。
+///
+/// 用法:`Slider { min: 64; max: 200; value: x; changed(v) => {...} }`。
+/// **值不会自己写回去** —— 它是 `in-out`,调用方负责接住 `changed` 再赋回来
+/// (或者直接双向绑定)。
+export component Slider inherits Rectangle {
+    in property <float> min: 0.0;
+    in property <float> max: 1.0;
+    in-out property <float> value: 0.0;
+
+    /// 值变了。**回调名故意不叫 `changed`** —— 那和 `changed <属性> => {}` 的
+    /// 语法关键字撞名,读起来也含混。
+    callback moved-to(float);
+
+    /// 滑块直径
+    property <length> knob-size: 14px;
+    /// 已经划过的那一段占的比例(0..1)
+    property <float> ratio:
+        root.max > root.min ? clamp((root.value - root.min) / (root.max - root.min), 0, 1) : 0;
+
+    /// 轨道上的位置 → 值。
+    ///
+    /// 写成**组件级函数**而不是 TouchArea 里的局部函数:局部函数在这种
+    /// 元素里能不能用没把握,而组件级的一定能。
+    function value-at(x: length) -> float {
+        return root.min + (root.max - root.min) * clamp(x / root.width, 0, 1);
+    }
+
+    height: 22px;
+    background: transparent;
+
+    // 轨道
+    Rectangle {
+        height: 4px;
+        width: parent.width;
+        y: (parent.height - self.height) / 2;
+        border-radius: 2px * Theme.radius-scale;
+        background: Theme.inset;
+        border-width: 1px;
+        border-color: Theme.border;
+    }
+
+    // 已划过的部分
+    Rectangle {
+        height: 4px;
+        width: 6px + (parent.width - 12px) * root.ratio;
+        y: (parent.height - self.height) / 2;
+        border-radius: 2px * Theme.radius-scale;
+        background: Theme.accent;
+    }
+
+    // 滑块。**必须留出半径的行程**,否则两端会被裁掉半截。
+    Rectangle {
+        width: root.knob-size;
+        height: root.knob-size;
+        x: (parent.width - root.knob-size) * root.ratio;
+        y: (parent.height - self.height) / 2;
+        border-radius: (root.knob-size / 2) * Theme.radius-scale;
+        background: Theme.card;
+        border-width: 2px;
+        border-color: Theme.accent-ink;
+        drop-shadow-color: Theme.shadow;
+        drop-shadow-blur: 4px;
+    }
+
+    // 整条轨道都能点,点了直接跳过去(跟系统滑杆一致)
+    touch := TouchArea {
+        // **尺寸必须写死成 parent 的**,不能靠默认值:实测不写的话它只有 78px 宽
+        // (滑杆本身 380px),于是滑杆右半边根本点不到,而且 value-at 里除的
+        // `touch.width` 也不是轨道宽度 —— 一拖值就飞。
+        width: parent.width;
+        height: parent.height;
+        mouse-cursor: pointer;
+
+        // `pressed` 是 out 属性,没有 pressed 回调 —— 只能监听它的变化
+        // (按下和抬起都会触发),所以里面要判一下当前是不是按着。
+        changed pressed => {
+            if (self.pressed) {
+                root.value = root.value-at(self.mouse-x);
+                root.moved-to(root.value);
+            }
+        }
+
+        // moved 只在按着的时候发
+        moved => {
+            root.value = root.value-at(self.mouse-x);
+            root.moved-to(root.value);
+        }
+    }
+}
+
+/// 小胶囊,用来做单选(提前多久提醒)
+export component Chip inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected: false;
+
+    callback clicked();
+
+    height: 26px;
+    border-radius: 7px * Theme.radius-scale;
+    border-width: 1px;
+    border-color: selected ? Theme.accent-ink : Theme.border;
+    background: selected ? Theme.accent
+        : (touch.has-hover ? Theme.hover : Theme.inset);
+
+    animate background { duration: 120ms; }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        Text {
+            text: root.label;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+            wrap: no-wrap;
+            color: selected ? Theme.accent-fg : Theme.text-dim;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// 标题栏右上角那种小按钮(最小化/最大化/关闭)
+export component WindowButton inherits Rectangle {
+    in property <image> icon;
+    /// 关闭按钮:悬停时变红
+    in property <bool> danger: false;
+
+    callback clicked();
+
+    width: 42px;
+    height: 32px;
+    border-radius: 6px * Theme.radius-scale;
+    background: touch.has-hover ? (danger ? Theme.danger : Theme.hover) : transparent;
+
+    animate background { duration: 100ms; }
+
+    Image {
+        source: root.icon;
+        width: 12px;
+        height: 12px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        colorize: (root.danger && touch.has-hover) ? #ffffff : Theme.text-dim;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// 实心主按钮(浮层里的「保存」)
+export component PrimaryButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+
+    callback clicked();
+
+    height: 30px;
+    border-radius: 8px * Theme.radius-scale;
+    opacity: enabled ? 1 : 0.4;
+    background: (root.enabled && touch.pressed) ? Theme.accent.darker(0.15)
+        : (root.enabled && touch.has-hover) ? Theme.accent.brighter(0.08)
+        : Theme.accent;
+
+    animate background { duration: 120ms; }
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        Text {
+            text: root.label;
+            color: Theme.accent-fg;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+}
+
+/// 一团柔光色斑。
+///
+/// 圆心用**父级尺寸的比例**给(见 at-x / at-y),不是像素 —— 这样窗口拉大拉小
+/// 整张底衬跟着成比例,不会出现「窗口一放大色斑就缩在角落里」。
+///
+/// 圆心是允许超出 0~1 的:放到窗口外面,窗口里就只剩一道渐隐的尾巴。
+/// 第一版就是三个圆心全丢在窗口外,结果只能看到最淡的那圈衰减,整张底衬
+/// 糊成一片白 —— 玻璃透上来自然也就没颜色了。
+/// 圆心得由调用方用**长度**传进来(比例换算在调用处做),不是这里图省事:
+/// 组件根元素访问不到 `parent`,想在这里自己乘父级宽高是做不到的。
+component Blob inherits Rectangle {
+    in property <length> center-x: 0px;
+    in property <length> center-y: 0px;
+    in property <length> size: 400px;
+    in property <color> tint;
+
+    width: size;
+    height: size;
+    x: center-x - size / 2;
+    y: center-y - size / 2;
+    background: @radial-gradient(circle, tint 0%, tint.with-alpha(0) 70%);
+}
+
+/// 窗口底衬:底色 + 三团柔光色斑。
+///
+/// 这是毛玻璃「底下那层」。web 上这层通常是张照片或鲜艳渐变 —— 背景要是没颜色,
+/// 玻璃透上来还是灰的,玻璃感就立不住。
+///
+/// 这里用径向渐变代替「画色块 + 再模糊」:alpha 从圆心一路衰减到半径的 70% 处
+/// 归零,边缘本来就是软的,不需要再模糊一遍。这也是没有 backdrop-filter 时的
+/// 正解 —— 模糊一张已经糊的图,和不模糊没有区别。
+export component Backdrop inherits Rectangle {
+    background: Theme.bg;
+
+    // 三个色斑分居左上 / 右侧 / 下方,圆心都落在窗口内,这样能看到最饱和的那一段。
+    //
+    // 圆心别往窗口外挪:挪出去就只剩最淡的那圈尾巴,整张底衬糊成一片白
+    // (第一版就是这个毛病)。同理也别顶到最上面 —— 上面压着标题栏和头部,
+    // 最饱和的核心会被盖住,白调一场。
+    Blob {
+        center-x: parent.width * 0.28;
+        center-y: parent.height * 0.17;
+        size: parent.width * 1.05;
+        tint: Theme.blob-a;
+    }
+    Blob {
+        center-x: parent.width * 1.05;
+        center-y: parent.height * 0.55;
+        size: parent.width * 0.95;
+        tint: Theme.blob-b;
+    }
+    Blob {
+        center-x: parent.width * 0.35;
+        center-y: parent.height * 1.00;
+        size: parent.width * 1.00;
+        tint: Theme.blob-c;
+    }
+
+    // 工业风的坐标网格(CAD 图纸那种淡淡的方格纸)。
+    //
+    // 非 industrial 时 Theme.grid-line 是 transparent,这些线画了也看不见 ——
+    // 跟色斑一个套路,靠颜色关掉而不是靠 `if`。
+    //
+    // 位置直接按下标算,没走布局:线间距固定 32px,而布局是"把空间均分给子项",
+    // 两者逻辑对不上。下标数组的长度按**窗口最大尺寸**取够
+    // (竖线覆盖 40×32=1280px,横线 35×32=1120px),超出的部分被窗口裁掉。
+    //
+    // 只铺一种密度的线会像屏幕脏了,所以每 5 格一根主线、颜色重一档。
+    for i in [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+        10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+        20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+        30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+    ] : Rectangle {
+        x: i * 32px;
+        y: 0;
+        width: 1px;
+        height: parent.height;
+        background: Math.mod(i, 5) == 0 ? Theme.grid-line-major : Theme.grid-line;
+    }
+    for i in [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+        10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+        20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+        30, 31, 32, 33, 34,
+    ] : Rectangle {
+        x: 0;
+        y: i * 32px;
+        width: parent.width;
+        height: 1px;
+        background: Math.mod(i, 5) == 0 ? Theme.grid-line-major : Theme.grid-line;
+    }
+}
+
+/// 任务行右侧的时间徽标
+export component TimeBadge inherits Rectangle {
+    in property <string> text;
+    in property <bool> overdue: false;
+
+    height: 20px;
+    border-radius: 6px * Theme.radius-scale;
+    background: overdue ? Theme.danger.with-alpha(0.14) : Theme.inset;
+
+    HorizontalLayout {
+        padding-left: 7px;
+        padding-right: 7px;
+        Text {
+            text: root.text;
+            font-size: 12px;
+            vertical-alignment: center;
+            color: root.overdue ? Theme.danger : Theme.text-dim;
+        }
+    }
+}
