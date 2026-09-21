@@ -12,19 +12,22 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ai;
 mod calendar_info;
+mod markdown;
 mod model;
 mod pet;
 mod platform;
 mod reminder;
 
 use std::cell::{Cell, RefCell};
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Local, NaiveDate, NaiveTime, Timelike};
-use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use model::{AppearanceName, DataFile, Due, ThemeName, Todo};
 use platform::TrayAction;
@@ -192,6 +195,36 @@ fn next_rand(seed: &mut u64) -> u64 {
     x ^= x << 17;
     *seed = x;
     x
+}
+
+// ── AI 对话 ────────────────────────────────────────────────────────────
+
+/// 流式拉取增量的事件轮询间隔。
+///
+/// 比帧率还快一点:网络来的包本来就是一坨一坨的,50ms 一次既跟得上,
+/// 又不会让 UI 每来一个字就重排一次。
+const CHAT_TICK: Duration = Duration::from_millis(50);
+/// 一个 tick 里最多处理多少个网络包(剩下的下个 tick 继续)。
+/// 不设上限的话,遇到「一口气灌几千个包」的服务会把 UI 饿死。
+const CHAT_MAX_PACKETS_PER_TICK: usize = 40;
+/// 发给模型的历史条数上限(不含 system 提示词)。
+/// 超了就从**最老的**开始丢 —— 桌宠聊天不需要记得住几十轮之前的事,
+/// 而上下文越长越贵、越慢。
+const CHAT_HISTORY_LIMIT: usize = 20;
+/// 草稿本预览的刷新间隔。比聊天那个慢一点:这是「边打字边看」,
+/// 太快反而会让滚动位置抖动;120ms 人眼已经觉得是即时的了。
+const NOTES_TICK: Duration = Duration::from_millis(120);
+/// 对话窗和桌宠之间的间距(定位用)
+const CHAT_GAP: i32 = 12;
+
+/// 后台线程 → UI 线程的事件
+enum ChatEvent {
+    /// 一小段正文增量
+    Delta(String),
+    /// 流正常结束
+    Done,
+    /// 出错(网络、HTTP 状态、服务端 error 包、被中断)
+    Failed(String),
 }
 
 /// 提醒扫描间隔
@@ -397,6 +430,45 @@ struct State {
     /// 桌宠窗口上一次算出来的高度。只有它变了才动窗口 ——
     /// 不然每次同步都 set_position,用户拖着的时候会被拽回去。
     pet_h: Cell<f32>,
+    /// AI 对话窗口
+    chat: RefCell<Option<Rc<ChatWindow>>>,
+    /// 对话窗那份消息模型(宿主和 UI 共用同一个 VecModel,流式时用 set_row_data 改最后一条)
+    chat_model: Rc<VecModel<ChatMsg>>,
+    /// 发给模型的对话历史(**不含** system 提示词,那个每次现拼)
+    chat_history: RefCell<Vec<ai::Message>>,
+    chat_busy: Cell<bool>,
+    /// 状态行:忙时是「正在思考…」,闲时非空说明上一条是错误
+    chat_status: RefCell<String>,
+    /// 本次请求的取消标志。**每次请求新建一个**,不复用全局标志位 ——
+    /// 参考项目里就有「上一次忘了复位,下一次一按就被取消」的坑。
+    chat_cancel: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    /// 后台线程送增量回来的那一端
+    chat_rx: RefCell<Option<std::sync::mpsc::Receiver<ChatEvent>>>,
+    /// 拉增量的定时器,只在有请求在跑时开着
+    chat_timer: RefCell<Option<Timer>>,
+    /// 每追加一次就 +1,UI 收到就把消息列表滚到底
+    chat_scroll_tick: Cell<i32>,
+    /// 接口设置面板开着没有
+    chat_config_open: Cell<bool>,
+    /// 接口配置(base_url / api_key / model),单独存在 ai.json
+    chat_cfg: RefCell<model::AiConfig>,
+    chat_cfg_path: PathBuf,
+    /// Markdown 草稿本窗口
+    notes: RefCell<Option<Rc<NotesWindow>>>,
+    /// 草稿本的文件路径(`%APPDATA%\rgui-todo\notes.md`)
+    notes_path: PathBuf,
+    /// 源码改动还没存盘
+    notes_dirty: Cell<bool>,
+    notes_status: RefCell<String>,
+    /// 预览用的块
+    notes_blocks: Rc<VecModel<MdBlock>>,
+    /// 上一次切块时的源码,用来判断「要不要重新解析」
+    notes_last_source: RefCell<String>,
+    notes_tick: Cell<i32>,
+    /// 预览的刷新定时器(只在窗口可见时跑)
+    notes_timer: RefCell<Option<Timer>>,
+    /// 单击桌宠的延迟定时器(见 State::pet_clicked)
+    pet_click_timer: RefCell<Option<Timer>>,
     /// 「让窗口整窗口重画一次」用的定时器。**必须留着**:
     /// Slint 的 Timer 一旦被 drop 就会停掉(踩过这个坑,见 main 里那段注释),
     /// 写成局部变量就等于定时器永远不触发。
@@ -831,6 +903,20 @@ impl State {
             theme.set_preference(preference);
             theme.set_appearance(appearance);
         }
+
+        // 对话窗和草稿本也是独立窗口,同样各持一份 Theme —— 漏了它切外观就不跟着变
+        let chat = self.chat.borrow().as_ref().cloned();
+        if let Some(chat) = chat {
+            let theme = chat.global::<Theme>();
+            theme.set_preference(preference);
+            theme.set_appearance(appearance);
+        }
+        let notes = self.notes.borrow().as_ref().cloned();
+        if let Some(notes) = notes {
+            let theme = notes.global::<Theme>();
+            theme.set_preference(preference);
+            theme.set_appearance(appearance);
+        }
     }
 
     /// 切外观。改状态 → 推给两个窗口 → 跟着调窗口圆角 → 落盘。
@@ -855,7 +941,7 @@ impl State {
         self.push_pet_settings();
 
         // 走 reveal 而不是 show:见 reveal 的说明,直接 show 会只画一部分
-        if let Err(err) = self.reveal(&*settings) {
+        if let Err(err) = self.reveal(&*settings, platform::SETTINGS_TITLE) {
             platform::log(&format!("显示设置窗口失败: {err}"));
             return;
         }
@@ -1402,6 +1488,586 @@ impl State {
         self.pet_drag.set(None);
     }
 
+    // ── Markdown 草稿本 ────────────────────────────────────────────────
+
+    /// 把源码重新切块并推给预览。
+    ///
+    /// 只在**源码真的变了**的时候调用(定时器里比对),不然每次轮询都重建一遍模型,
+    /// 预览会一直闪、滚动位置也保不住。
+    fn push_notes_blocks(&self) {
+        let Some(notes) = self.notes.borrow().as_ref().cloned() else { return };
+        let source = notes.global::<AppData>().get_md_source().to_string();
+        if *self.notes_last_source.borrow() == source {
+            return;
+        }
+        *self.notes_last_source.borrow_mut() = source.clone();
+
+        let blocks: Vec<MdBlock> = markdown::parse(&source).into_iter().map(to_ui_block).collect();
+        self.notes_blocks.set_vec(blocks);
+
+        let app = notes.global::<AppData>();
+        app.set_md_blocks(ModelRc::from(self.notes_blocks.clone()));
+        self.notes_tick.set(self.notes_tick.get() + 1);
+        app.set_md_tick(self.notes_tick.get());
+        // 打字就算「没存」——状态行会变色提醒
+        if !self.notes_dirty.get() && !source.is_empty() {
+            self.set_notes_dirty(true);
+        }
+    }
+
+    fn set_notes_dirty(&self, dirty: bool) {
+        self.notes_dirty.set(dirty);
+        if let Some(notes) = self.notes.borrow().as_ref() {
+            notes.global::<AppData>().set_md_dirty(dirty);
+        }
+    }
+
+    fn set_notes_status(&self, text: &str) {
+        *self.notes_status.borrow_mut() = text.to_string();
+        if let Some(notes) = self.notes.borrow().as_ref() {
+            notes.global::<AppData>().set_md_status(text.into());
+        }
+    }
+
+    /// 存盘。关窗口时也会走一次(不然写了一半的笔记就没了)。
+    fn save_notes(&self) {
+        let Some(notes) = self.notes.borrow().as_ref().cloned() else { return };
+        let source = notes.global::<AppData>().get_md_source().to_string();
+        if !self.notes_dirty.get() {
+            self.set_notes_status(&format!("已保存到 {}", self.notes_path.display()));
+            return;
+        }
+        match std::fs::write(&self.notes_path, &source) {
+            Ok(()) => {
+                self.set_notes_dirty(false);
+                self.set_notes_status(&format!("已保存到 {}", self.notes_path.display()));
+            }
+            Err(err) => {
+                // 存不上要说清楚:用户以为存了、其实没有,那才是真的丢东西
+                platform::log(&format!("保存笔记失败: {err}"));
+                self.set_notes_status(&format!("保存失败: {err}"));
+            }
+        }
+    }
+
+    /// 打开草稿本(第一次进来先把文件读出来)
+    fn open_notes(&self) {
+        let Some(notes) = self.notes.borrow().as_ref().cloned() else {
+            platform::log("笔记窗口没建起来");
+            return;
+        };
+        // 读盘:文件不在就是第一次,给一段示例内容当引导
+        let text = std::fs::read_to_string(&self.notes_path).unwrap_or_else(|_| {
+            "# 欢迎
+\n这是 Markdown 草稿本,左边写、右边实时预览。\n\n- 支持**加粗**、*斜体*、`行内代码`\n- 支持清单\n- 还有代码块:\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\n> 引用、分隔线、表格也能渲染。\n\n---\n\n| 快捷键 | 作用 |\n|---|---|\n| Ctrl+S | 保存 |\n".to_string()
+        });
+        *self.notes_last_source.borrow_mut() = text.clone();
+        let blocks: Vec<MdBlock> = markdown::parse(&text).into_iter().map(to_ui_block).collect();
+        self.notes_blocks.set_vec(blocks);
+
+        {
+            let app = notes.global::<AppData>();
+            app.set_md_source(text.as_str().into());
+            app.set_md_blocks(ModelRc::from(self.notes_blocks.clone()));
+            app.set_md_status(format!("文件: {}", self.notes_path.display()).as_str().into());
+            app.set_md_dirty(false);
+        }
+        self.notes_dirty.set(false);
+
+        self.layout_notes_window();
+        if let Err(err) = self.reveal(&*notes, platform::NOTES_TITLE) {
+            platform::log(&format!("显示笔记窗口失败: {err}"));
+        }
+        platform::bring_to_front(platform::NOTES_TITLE);
+
+        // 预览刷新定时器:只在窗口开着的时候跑
+        let Some(me) = self.me.borrow().upgrade() else { return };
+        if self.notes_timer.borrow().is_none() {
+            *self.notes_timer.borrow_mut() = Some(Timer::default());
+        }
+        if let Some(t) = self.notes_timer.borrow().as_ref() {
+            t.start(TimerMode::Repeated, NOTES_TICK, move || me.poll_notes());
+        }
+    }
+
+    /// 定时器里跑:源码变了就重新切块(实时预览就是靠这个)
+    fn poll_notes(&self) {
+        let Some(notes) = self.notes.borrow().as_ref().cloned() else { return };
+        if !notes.window().is_visible() {
+            return;
+        }
+        self.push_notes_blocks();
+    }
+
+    /// 关草稿本:**先存再藏**,别让用户白写
+    fn close_notes(&self) {
+        self.save_notes();
+        if let Some(notes) = self.notes.borrow().as_ref() {
+            let _ = notes.hide();
+        }
+        if let Some(t) = self.notes_timer.borrow().as_ref() {
+            t.stop();
+        }
+    }
+
+    /// 把一段 Markdown 追加到草稿本末尾(AI 回复旁边的「存到笔记」)。
+    ///
+    /// 走的是**同一个文件**:先读盘(以盘上的为准,免得窗口没开过、内存里是空的),
+    /// 追加,再存回去并刷新预览。
+    fn append_to_notes(&self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let mut current = std::fs::read_to_string(&self.notes_path).unwrap_or_default();
+        if !current.is_empty() && !current.ends_with('\n') {
+            current.push('\n');
+        }
+        current.push_str("\n---\n\n");
+        current.push_str(text);
+        current.push('\n');
+
+        if let Err(err) = std::fs::write(&self.notes_path, &current) {
+            platform::log(&format!("追加到笔记失败: {err}"));
+            return;
+        }
+        // 草稿本开着的话同步刷新(不然它显示的还是旧内容)
+        if let Some(notes) = self.notes.borrow().as_ref().cloned() {
+            let app = notes.global::<AppData>();
+            app.set_md_source(current.as_str().into());
+            let blocks: Vec<MdBlock> =
+                markdown::parse(&current).into_iter().map(to_ui_block).collect();
+            self.notes_blocks.set_vec(blocks);
+            app.set_md_blocks(ModelRc::from(self.notes_blocks.clone()));
+            *self.notes_last_source.borrow_mut() = current.clone();
+        }
+        let _ = self.notes_dirty.set(false);
+    }
+
+    /// 摆在主窗口旁边(居中于屏幕,和主窗口错开一点)
+    fn layout_notes_window(&self) {
+        let Some(notes) = self.notes.borrow().as_ref().cloned() else { return };
+        let size = notes.window().size();
+        let (wx, wy, ww, wh) = platform::work_area();
+        let x = wx + (ww - size.width as i32) / 2;
+        let y = wy + (wh - size.height as i32) / 2;
+        notes.window().set_position(slint::PhysicalPosition::new(x, y));
+    }
+
+    // ── AI 对话 ────────────────────────────────────────────────────────
+    //
+    // 线程模型:**网络在后台线程跑,UI 只在主线程碰**。
+    // 本项目没有 async runtime(全靠 Slint 的 Timer + channel 驱动),所以不学
+    // 参考项目引 tokio,而是最朴素的一套:
+    //
+    //   主线程 start_chat ──spawn──▶ 后台线程(ureq 阻塞读 SSE)──mpsc──▶ 主线程 Timer 轮询
+    //
+    // 这和托盘图标那套(全局 channel + 定时器轮询)是同一个形状,项目里已经有先例。
+
+    /// 把消息模型 + 运行状态推给对话窗。
+    ///
+    /// **不推接口配置** —— 那三个字段是双向绑定的,推一次就会把用户正在编辑的
+    /// 输入框覆盖掉。配置只在「打开窗口」和「保存之后」推(见 push_chat_config)。
+    fn push_chat(&self) {
+        let Some(chat) = self.chat.borrow().as_ref().cloned() else { return };
+        let app = chat.global::<AppData>();
+        app.set_chat_messages(ModelRc::from(self.chat_model.clone()));
+        app.set_chat_busy(self.chat_busy.get());
+        app.set_chat_status(self.chat_status.borrow().as_str().into());
+        app.set_chat_scroll_tick(self.chat_scroll_tick.get());
+        app.set_chat_config_open(self.chat_config_open.get());
+    }
+
+    /// 只在「该显示配置」的时候推那三个字段
+    fn push_chat_config(&self) {
+        let Some(chat) = self.chat.borrow().as_ref().cloned() else { return };
+        let cfg = self.chat_cfg.borrow();
+        let app = chat.global::<AppData>();
+        app.set_chat_base_url(cfg.base_url.as_str().into());
+        app.set_chat_api_key(cfg.api_key.as_str().into());
+        app.set_chat_model(cfg.model.as_str().into());
+    }
+
+    fn set_chat_status(&self, text: &str) {
+        *self.chat_status.borrow_mut() = text.to_string();
+        if let Some(chat) = self.chat.borrow().as_ref() {
+            chat.global::<AppData>().set_chat_status(text.into());
+        }
+    }
+
+    /// 往对话里追加一条消息(同时推给 UI)
+    fn push_chat_msg(&self, msg: ChatMsg) {
+        self.chat_model.push(msg);
+        self.chat_scroll_tick.set(self.chat_scroll_tick.get() + 1);
+        if let Some(chat) = self.chat.borrow().as_ref() {
+            chat.global::<AppData>()
+                .set_chat_scroll_tick(self.chat_scroll_tick.get());
+        }
+    }
+
+    /// 设置面板开关
+    fn toggle_chat_config(&self) {
+        let open = !self.chat_config_open.get();
+        self.chat_config_open.set(open);
+        if open {
+            // 打开时才把当前配置灌进输入框(平时不推,免得覆盖用户的编辑)
+            self.push_chat_config();
+        }
+        if let Some(chat) = self.chat.borrow().as_ref() {
+            chat.global::<AppData>().set_chat_config_open(open);
+        }
+    }
+
+    /// 保存接口配置
+    fn save_chat_config(&self, base_url: &str, api_key: &str, model: &str) {
+        {
+            let mut cfg = self.chat_cfg.borrow_mut();
+            cfg.base_url = base_url.trim().to_string();
+            cfg.api_key = api_key.trim().to_string();
+            cfg.model = model.trim().to_string();
+        }
+        let result = {
+            let cfg = self.chat_cfg.borrow();
+            model::save_ai(&self.chat_cfg_path, &cfg)
+        };
+        match result {
+            Ok(()) => {
+                self.set_chat_status("");
+                self.chat_config_open.set(false);
+                if let Some(chat) = self.chat.borrow().as_ref() {
+                    chat.global::<AppData>().set_chat_config_open(false);
+                }
+                self.push_chat_config(); // 回填去掉首尾空格后的值
+            }
+            Err(err) => self.set_chat_status(&format!("配置没存上: {err}")),
+        }
+    }
+
+    /// 双击桌宠:弹出对话窗(已经在开着就只叫到前面)
+    fn open_chat(&self) {
+        let Some(chat) = self.chat.borrow().as_ref().cloned() else {
+            platform::log("对话窗口没建起来,双击桌宠没反应");
+            return;
+        };
+        // 第一次打开时如果还没配好接口,直接把设置面板摊开
+        if !self.chat_cfg.borrow().is_ready() && self.chat_model.row_count() == 0 {
+            self.chat_config_open.set(true);
+            self.push_chat_config();
+        }
+        self.layout_chat_window();
+        if let Err(err) = self.reveal(&*chat, platform::CHAT_TITLE) {
+            platform::log(&format!("显示对话窗口失败: {err}"));
+        }
+        self.push_chat();
+        platform::bring_to_front(platform::CHAT_TITLE);
+    }
+
+    /// 关掉对话窗(只是藏起来,聊天记录留着,下次双击接着看)
+    fn close_chat(&self) {
+        if let Some(chat) = self.chat.borrow().as_ref() {
+            let _ = chat.hide();
+        }
+        self.cancel_chat();
+    }
+
+    /// 把对话窗摆在桌宠**旁边**:右边放得下就放右边,放不下翻到左边。
+    ///
+    /// 竖直方向让底边和宠物对齐(看起来像从宠物「长」出来的),再整体夹进工作区,
+    /// 免得贴边时露出屏幕外。
+    fn layout_chat_window(&self) {
+        let Some(chat) = self.chat.borrow().as_ref().cloned() else { return };
+        let Some(pet) = self.pet.borrow().as_ref().cloned() else { return };
+
+        let pet_pos = pet.window().position();
+        let pet_size = pet.window().size();
+        let chat_size = chat.window().size();
+        let (pw, ph) = (pet_size.width as i32, pet_size.height as i32);
+        let (cw, ch) = (chat_size.width as i32, chat_size.height as i32);
+        let (wx, wy, ww, wh) = platform::work_area();
+
+        let right = pet_pos.x + pw + CHAT_GAP;
+        let left = pet_pos.x - cw - CHAT_GAP;
+        // 右边放得下就用右边;否则用左边;两边都放不下(屏幕太窄)就贴着工作区右边缘
+        let x = if right + cw <= wx + ww {
+            right
+        } else if left >= wx {
+            left
+        } else {
+            (wx + ww - cw).max(wx)
+        };
+        // 底边对齐宠物,再夹进工作区
+        let y = (pet_pos.y + ph - ch).clamp(wy, (wy + wh - ch).max(wy));
+
+        chat.window().set_position(slint::PhysicalPosition::new(x, y));
+    }
+
+    /// 发一条消息:起后台线程去请求,增量通过 channel 回来
+    fn start_chat(&self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() || self.chat_busy.get() {
+            return;
+        }
+
+        let cfg = (*self.chat_cfg.borrow()).clone();
+        if let Some(missing) = cfg.missing() {
+            self.chat_config_open.set(true);
+            self.push_chat_config();
+            if let Some(chat) = self.chat.borrow().as_ref() {
+                chat.global::<AppData>().set_chat_config_open(true);
+            }
+            self.set_chat_status(&format!("还差「{missing}」—— 在上面填好再发。"));
+            return;
+        }
+
+        // 1. 用户那条进模型和历史
+        self.push_chat_msg(ChatMsg {
+            who: ChatWho::User,
+            text: text.into(),
+            streaming: false,
+            // 用户消息不按 Markdown 解析:随手打的表情、星号不该被吃掉
+            blocks: chat_blocks(""),
+        });
+        self.chat_history.borrow_mut().push(ai::Message {
+            role: ai::Role::User,
+            content: text.to_string(),
+        });
+        // 2. 助手那条先占位(流式往里追加);历史里也先放一条空的,
+        //    这样每个增量只需要 push_str,不用每次去找「最后一条是不是助手」
+        self.push_chat_msg(ChatMsg {
+            who: ChatWho::Assistant,
+            text: "".into(),
+            streaming: true,
+            blocks: chat_blocks(""),
+        });
+        self.chat_history.borrow_mut().push(ai::Message {
+            role: ai::Role::Assistant,
+            content: String::new(),
+        });
+
+        // 3. 请求体:system 提示词 + 最近若干轮
+        let pending = self.remaining_count() as usize;
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let mut messages = vec![ai::Message {
+            role: ai::Role::System,
+            content: ai::system_prompt(pending, &today),
+        }];
+        {
+            let history = self.chat_history.borrow();
+            let start = history.len().saturating_sub(CHAT_HISTORY_LIMIT);
+            messages.extend_from_slice(&history[start..]);
+        }
+
+        // 4. 清掉输入框、切忙碌态、桌宠切「看书」
+        self.chat_busy.set(true);
+        if let Some(chat) = self.chat.borrow().as_ref() {
+            let app = chat.global::<AppData>();
+            app.set_chat_draft("".into());
+            app.set_chat_busy(true);
+        }
+        self.set_chat_status("正在思考…");
+        self.play_pet_cue("read");
+
+        // 5. 开工
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *self.chat_cancel.borrow_mut() = Some(cancel.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.chat_rx.borrow_mut() = Some(rx);
+        let spawned = std::thread::Builder::new()
+            .name("rgui-ai-chat".into())
+            .spawn(move || run_chat(cfg, messages, cancel, tx));
+        if let Err(err) = spawned {
+            self.end_chat();
+            self.set_chat_status(&format!("起不了后台线程: {err}"));
+            return;
+        }
+
+        // 6. 开轮询定时器
+        let Some(me) = self.me.borrow().upgrade() else { return };
+        if self.chat_timer.borrow().is_none() {
+            *self.chat_timer.borrow_mut() = Some(Timer::default());
+        }
+        if let Some(t) = self.chat_timer.borrow().as_ref() {
+            t.start(TimerMode::Repeated, CHAT_TICK, move || me.poll_chat());
+        }
+    }
+
+    /// 拉一次增量(定时器里跑,主线程)
+    fn poll_chat(&self) {
+        let mut finished = false;
+        let mut buffer = String::new();
+        {
+            let rx = self.chat_rx.borrow();
+            let Some(rx) = rx.as_ref() else { return };
+            for _ in 0..CHAT_MAX_PACKETS_PER_TICK {
+                match rx.try_recv() {
+                    // 同一 tick 里的增量**攒成一整块再写模型**:一次网络读可能带来
+                    // 好几个包,逐个改模型会让 UI 白重排好几次
+                    Ok(ChatEvent::Delta(t)) => buffer.push_str(&t),
+                    Ok(ChatEvent::Done) => {
+                        finished = true;
+                        break;
+                    }
+                    Ok(ChatEvent::Failed(msg)) => {
+                        finished = true;
+                        self.fail_chat(&msg, buffer.is_empty());
+                        buffer.clear();
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // 线程没了却没发 Done:算正常收尾,别把界面卡在「忙碌」上
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            self.append_chat_delta(&buffer);
+        }
+        if finished {
+            self.end_chat();
+        }
+    }
+
+    /// 把一段增量追加到最后一条助手消息上
+    fn append_chat_delta(&self, text: &str) {
+        let idx = self.chat_model.row_count().saturating_sub(1);
+        let Some(ChatMsg { who, text: cur, streaming, blocks: _ }) = self.chat_model.row_data(idx)
+        else {
+            return;
+        };
+        if who != ChatWho::Assistant {
+            return;
+        }
+        let full = format!("{cur}{text}");
+        self.chat_model.set_row_data(
+            idx,
+            ChatMsg {
+                who,
+                // 每个 tick 把整段重新切一次块。增量是按 tick 攒过的(见 poll_chat),
+                // 所以这里是 ~20 次/秒、每次几 KB 的量级,完全无所谓;
+                // 换来的好处是不用维护「哪些块已经定型了」这种增量状态。
+                blocks: chat_blocks(&full),
+                text: full.as_str().into(),
+                streaming,
+            },
+        );
+        if let Some(last) = self.chat_history.borrow_mut().last_mut() {
+            last.content.push_str(text);
+        }
+        self.chat_scroll_tick.set(self.chat_scroll_tick.get() + 1);
+        if let Some(chat) = self.chat.borrow().as_ref() {
+            chat.global::<AppData>()
+                .set_chat_scroll_tick(self.chat_scroll_tick.get());
+        }
+    }
+
+    /// 出错:把错误当成一条系统提示写进对话(跟着记录一起滚动),
+    /// 状态行也留一句,免得用户以为是自己没发出去。
+    fn fail_chat(&self, msg: &str, placeholder_empty: bool) {
+        let idx = self.chat_model.row_count().saturating_sub(1);
+        if placeholder_empty {
+            // 助手那条还空着,直接把它换成系统提示,不留空气泡
+            if let Some(row) = self.chat_model.row_data(idx) {
+                if row.who == ChatWho::Assistant && row.text.is_empty() {
+                    self.chat_model.set_row_data(
+                        idx,
+                        ChatMsg {
+                            who: ChatWho::Note,
+                            text: msg.into(),
+                            streaming: false,
+                            blocks: chat_blocks(""),
+                        },
+                    );
+                    // 历史里那条空助手消息也去掉,免得下一轮请求带着一条空的
+                    let mut history = self.chat_history.borrow_mut();
+                    if history
+                        .last()
+                        .is_some_and(|m| m.role == ai::Role::Assistant && m.content.is_empty())
+                    {
+                        history.pop();
+                    }
+                    self.set_chat_status(msg);
+                    self.chat_scroll_tick.set(self.chat_scroll_tick.get() + 1);
+                    return;
+                }
+            }
+        }
+        // 已经有正文了(流到一半断的):正文留着,后面补一条提示
+        self.push_chat_msg(ChatMsg {
+            who: ChatWho::Note,
+            text: msg.into(),
+            streaming: false,
+            blocks: chat_blocks(""),
+        });
+        self.set_chat_status(msg);
+    }
+
+    /// 收尾:停定时器、清忙碌、桌宠回待机
+    fn end_chat(&self) {
+        self.chat_rx.borrow_mut().take();
+        *self.chat_cancel.borrow_mut() = None;
+        // ⚠️ 别写 `if let Some(t) = self.chat_timer.borrow_mut().take() { ... borrow_mut() ... }`:
+        // if-let 的临时借用活到**整个 if let 表达式结束**(含块体),块里再借一次
+        // 就是 RefCell already borrowed 直接 panic(这个坑刚踩过,程序当场没了)。
+        // 只借一次、原地停就行 —— Timer 留在槽里,下次 start 直接复用。
+        if let Some(t) = self.chat_timer.borrow().as_ref() {
+            t.stop();
+        }
+        // 最后一条不再闪光标
+        let idx = self.chat_model.row_count().saturating_sub(1);
+        if let Some(row) = self.chat_model.row_data(idx) {
+            if row.streaming {
+                self.chat_model.set_row_data(
+                    idx,
+                    ChatMsg {
+                        who: row.who,
+                        // 最后再切一次:收尾的这一轮增量可能还没进过切块
+                        blocks: chat_blocks(&row.text),
+                        text: row.text,
+                        streaming: false,
+                    },
+                );
+            }
+        }
+        self.chat_busy.set(false);
+        if let Some(chat) = self.chat.borrow().as_ref() {
+            chat.global::<AppData>().set_chat_busy(false);
+        }
+        // 清掉「正在思考…」。不清的话它会在不忙之后落进「错误提示」那个分支,
+        // 变成一行红字挂在那儿(实测就是这样)
+        self.set_chat_status("");
+        // 桌宠从「看书」回待机轮播
+        self.back_to_idle();
+    }
+
+    /// 中断这次生成(点停止、关窗口时都会走这儿)
+    fn cancel_chat(&self) {
+        if let Some(flag) = self.chat_cancel.borrow().as_ref() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.chat_busy.get() {
+            self.end_chat();
+            let idx = self.chat_model.row_count().saturating_sub(1);
+            let empty_assistant = self
+                .chat_model
+                .row_data(idx)
+                .is_some_and(|r| r.who == ChatWho::Assistant && r.text.is_empty());
+            if empty_assistant {
+                self.chat_model.set_row_data(
+                    idx,
+                    ChatMsg {
+                        who: ChatWho::Note,
+                        text: "已中断".into(),
+                        streaming: false,
+                        blocks: chat_blocks(""),
+                    },
+                );
+            }
+        }
+    }
+
     /// 设置里调桌宠大小。夹进合法范围 → 重排窗口 → 存盘。
     fn set_pet_size(&self, value: f32) {
         let value = model::clamp_pet_size(value);
@@ -1525,19 +2191,81 @@ impl State {
     }
 
     /// 双击宠物:把主窗口叫出来
-    fn show_main_window(&self) {
-        if let Some(ui) = self.ui.upgrade() {
-            let _ = ui.show();
+
+
+    /// 单击桌宠。**延迟 250ms 才真的执行**,双击来了就把这次单击取消。
+    ///
+    /// 不这么做的话:双击的第一下会先把「快速添加」输入条打开,窗口随之变高,
+    /// Slint 的双击判定就被这次尺寸变化打断,第二下只当成又一次单击 ——
+    /// 表现是「双击打不开对话窗,反而开了个输入条」(这是实测到的现象)。
+    fn pet_clicked(&self) {
+        let Some(me) = self.me.borrow().upgrade() else { return };
+        if self.pet_click_timer.borrow().is_none() {
+            *self.pet_click_timer.borrow_mut() = Some(Timer::default());
         }
-        platform::bring_to_front(platform::WINDOW_TITLE);
+        if let Some(t) = self.pet_click_timer.borrow().as_ref() {
+            t.start(TimerMode::SingleShot, Duration::from_millis(250), move || {
+                me.toggle_pet_input()
+            });
+        }
+    }
+
+    /// 双击桌宠:开对话窗(并把挂起的那次单击取消掉)
+    fn pet_double_clicked(&self) {
+        if let Some(t) = self.pet_click_timer.borrow().as_ref() {
+            t.stop();
+        }
+        self.open_chat();
+    }
+
+    /// 点未完成数角标(红点):直接看任务清单。
+    ///
+    /// 先把挂起的那次单击掐掉:红点和宠物用的是两个 TouchArea,按说只有上面那个
+    /// 会收到事件,但万一两个都算成自己的,250ms 后还会弹出快速添加输入条 ——
+    /// 刚打开的主窗口还没看清就被一条输入条顶上来,很怪。
+    fn pet_badge_clicked(&self) {
+        if let Some(t) = self.pet_click_timer.borrow().as_ref() {
+            t.stop();
+        }
+        // 从红点上拖走再松手,也会走一次 clicked —— 那不是「点」。
+        if self.take_pet_just_dragged() {
+            return;
+        }
+        self.open_task_list();
+    }
+
+    /// 把主窗口叫出来,并且切到列表视图。
+    ///
+    /// 和托盘「打开」的区别:那个只把窗口叫出来、停在用户上次看的视图;这个还要切到
+    /// 列表 —— 角标的含义就是「还有 N 条没做」,点它当然是来看这 N 条的。
+    fn open_task_list(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if self.view.get() != View::List {
+            self.set_view(View::List);
+        }
+        if let Err(err) = self.reveal(&ui, platform::WINDOW_TITLE) {
+            platform::log(&format!("显示主窗口失败: {err}"));
+        }
+        // 主窗口可能正被其它窗口盖着(尤其桌宠是 always-on-top):叫到前台才有意义,
+        // 光 show() 不够。
+        //
+        // 这里**不能用 `bring_to_front`**:它内含 `SW_RESTORE`,会把最大化的主窗口
+        // 缩回普通大小 —— 用户最大化着窗口,点个红点反而被缩了。还原最小化那件事
+        // 已经由 `reveal` 处理(它只在真的最小化时才还原)。
+        platform::focus_window(platform::WINDOW_TITLE);
+    }
+
+    /// 拖动松手时 TouchArea 也会发一次 `clicked`(松手时指针还在宠物上),
+    /// 那不是「点一下」。取走并清掉这个标记,让调用方决定怎么办。
+    fn take_pet_just_dragged(&self) -> bool {
+        let was = self.pet_just_dragged.get();
+        self.pet_just_dragged.set(false);
+        was
     }
 
     /// 点宠物:展开 / 收起快速添加
     fn toggle_pet_input(&self) {
-        // 拖动松手时 TouchArea 也会发一次 clicked(松手时指针还在宠物上)。
-        // 那不是"点一下",别顺手把输入条开了。
-        if self.pet_just_dragged.get() {
-            self.pet_just_dragged.set(false);
+        if self.take_pet_just_dragged() {
             return;
         }
         let open = !self.pet_adding.get();
@@ -1800,10 +2528,10 @@ impl State {
 
         match action {
             TrayAction::Open => {
-                let _ = self.reveal(&ui);
+                let _ = self.reveal(&ui, platform::WINDOW_TITLE);
             }
             TrayAction::Today => {
-                let _ = self.reveal(&ui);
+                let _ = self.reveal(&ui, platform::WINDOW_TITLE);
                 self.set_view(View::Calendar);
                 self.goto_today();
             }
@@ -1815,7 +2543,7 @@ impl State {
                 if let Some(pet) = self.pet.borrow().clone() {
                     if on {
                         self.layout_pet_window();
-                        let _ = self.reveal(&*pet);
+                        let _ = self.reveal(&*pet, platform::PET_TITLE);
                         platform::hide_from_taskbar(platform::PET_TITLE);
                         self.pet_fixup_pending.set(true);
                     } else {
@@ -1864,16 +2592,58 @@ impl State {
 ///
 /// 视觉上不可见:只是高度顶 1px 又收回来,而且发生在窗口刚出现的那一瞬间。
 impl State {
-    fn reveal<W: slint::ComponentHandle + 'static>(&self, ui: &W) -> Result<(), slint::PlatformError> {
-        let weak = ui.as_weak();
+    /// 显示窗口,必要时先把它从任务栏还原,然后让缓冲区重排一次。
+    ///
+    /// `title` 是窗口标题 —— 只用来问系统「这窗口最小化了吗」(见下)。
+    fn reveal<W: slint::ComponentHandle + 'static>(
+        &self,
+        ui: &W,
+        title: &str,
+    ) -> Result<(), slint::PlatformError> {
         ui.show()?;
 
+        // 最小化的窗口**必须绕开下面那个 ±1px 重排**:这时候 `Window::size()` 给的
+        // 是「任务栏缩略图」的尺寸(实测 160x28),拿它去重排,窗口就真被缩成一小条,
+        // 而且再也回不来(用户点托盘「打开」会看到主窗口变成一条)。
+        //
+        // 光把重排推迟也不行 —— 还原是同步生效的,但 Slint 缓存的尺寸要等 winit 把
+        // 事件推上来才更新,当场读到的还是缩略图尺寸。所以:先还原,再**等一拍**
+        // 重排,那时读到的才是真尺寸。
+        if platform::is_minimized(title) {
+            platform::restore_window(title);
+            let weak = ui.as_weak();
+            let Some(me) = self.me.borrow().upgrade() else { return Ok(()) };
+            let timer = Timer::default();
+            timer.start(
+                TimerMode::SingleShot,
+                Duration::from_millis(250),
+                move || {
+                    if let Some(ui) = weak.upgrade() {
+                        me.nudge_window(&ui);
+                    }
+                },
+            );
+            self.repaint_timers.borrow_mut().push(timer);
+            return Ok(());
+        }
+
+        self.nudge_window(ui);
+        Ok(())
+    }
+
+    /// 「±1px 顶一下再收回来」—— 逼 softbuffer 重新分配缓冲区,从而整窗口重画一次。
+    ///
+    /// 为什么需要它、以及为什么别的办法(请求重画、同一个 tick 里改两次尺寸)都不行,
+    /// 见这一节开头的长注释。**最小化的窗口千万别调**(原因见 `State::reveal`)。
+    fn nudge_window<W: slint::ComponentHandle + 'static>(&self, ui: &W) {
         // 换算成逻辑尺寸再改:set_size 收 LogicalSize,而 Window::size() 给的是物理的,
         // 直接拿物理数当逻辑用会在高 DPI 上把窗口缩小。
         let scale = ui.window().scale_factor();
         let size = ui.window().size().to_logical(scale);
-        ui.window().set_size(slint::LogicalSize::new(size.width, size.height + 1.0));
+        ui.window()
+            .set_size(slint::LogicalSize::new(size.width, size.height + 1.0));
 
+        let weak = ui.as_weak();
         let timer = Timer::default();
         timer.start(TimerMode::SingleShot, Duration::from_millis(120), move || {
             if let Some(ui) = weak.upgrade() {
@@ -1882,8 +2652,211 @@ impl State {
         });
         // Timer drop 掉就停了,必须留个引用
         self.repaint_timers.borrow_mut().push(timer);
-        Ok(())
     }
+}
+
+/// Markdown 源码切成 UI 用的块。
+///
+/// 块级由 `markdown::parse` 切(标题/代码/引用/分隔线/表格),**行内样式交给
+/// `StyledText::from_markdown`** —— Slint 1.18 的 `StyledText` 元素认 CommonMark 的
+/// 粗体/斜体/删除线/行内代码/链接/列表,正好补上它自己不做的那一层。
+///
+/// 解析失败就退回纯文本:宁可这一块没有样式,也不能整段不显示。
+fn styled(md: &str) -> slint::StyledText {
+    slint::StyledText::from_markdown(md)
+        .unwrap_or_else(|_| slint::StyledText::from_plain_text(md))
+}
+
+/// 空的单元格模型(非表格的块用它占位 —— Slint 的 `[MdCell]` 字段必须给个有效模型)
+fn empty_cells() -> ModelRc<MdCell> {
+    ModelRc::from(Rc::new(VecModel::<MdCell>::default()))
+}
+
+/// 把解析出来的块转成 Slint 侧的 `MdBlock`。
+///
+/// 注意两类字段的用途(见 widgets.slint 里 MdBlock 的说明):
+/// `text` 是给 `StyledText` 的富文本,`raw` 是给 `Text` 的**原样纯文本** ——
+/// 代码块和表格必须走 raw,否则代码里的 `*` 会被当成强调标记吃掉。
+fn to_ui_block(block: markdown::Block) -> MdBlock {
+    let s = |t: &str| t.to_string().as_str().into();
+    match block {
+        markdown::Block::Rich(text) => MdBlock {
+            kind: MdKind::Rich,
+            text: styled(&text),
+            raw: s(&text),
+            level: 1,
+            lang: "".into(),
+            cells: empty_cells(),
+        },
+        markdown::Block::Heading { level, text } => MdBlock {
+            kind: MdKind::Heading,
+            text: styled(&text),
+            raw: s(&text),
+            level: level as i32,
+            lang: "".into(),
+            cells: empty_cells(),
+        },
+        markdown::Block::Code { lang, code } => MdBlock {
+            kind: MdKind::Code,
+            text: slint::StyledText::from_plain_text(""),
+            raw: s(&code),
+            level: 1,
+            lang: s(&lang),
+            cells: empty_cells(),
+        },
+        markdown::Block::Quote(text) => MdBlock {
+            kind: MdKind::Quote,
+            text: styled(&text),
+            raw: s(&text),
+            level: 1,
+            lang: "".into(),
+            cells: empty_cells(),
+        },
+        markdown::Block::Rule => MdBlock {
+            kind: MdKind::Rule,
+            text: slint::StyledText::from_plain_text(""),
+            raw: "".into(),
+            level: 1,
+            lang: "".into(),
+            cells: empty_cells(),
+        },
+        markdown::Block::Table(rows) => {
+            // 拍平成一维 + 带行列号:Slint 那边要用 GridLayout 的 row/column 摆
+            let cells: Vec<MdCell> = rows
+                .iter()
+                .enumerate()
+                .flat_map(|(r, row)| {
+                    row.iter().enumerate().map(move |(c, text)| MdCell {
+                        text: text.as_str().into(),
+                        row: r as i32,
+                        col: c as i32,
+                        header: r == 0,
+                    })
+                })
+                .collect();
+            MdBlock {
+                kind: MdKind::Table,
+                text: slint::StyledText::from_plain_text(""),
+                raw: "".into(),
+                level: 1,
+                lang: "".into(),
+                cells: ModelRc::from(Rc::new(VecModel::from(cells))),
+            }
+        }
+    }
+}
+
+/// 把一段 Markdown 正文切成 UI 用的块模型。
+///
+/// 空文本给空模型:Slint 的 `[MdBlock]` 字段从 Rust 侧必须是个有效的 ModelRc,
+/// 不能留 undefined。
+fn chat_blocks(markdown: &str) -> ModelRc<MdBlock> {
+    let blocks: Vec<MdBlock> = if markdown.trim().is_empty() {
+        Vec::new()
+    } else {
+        markdown::parse(markdown).into_iter().map(to_ui_block).collect()
+    };
+    ModelRc::from(Rc::new(VecModel::from(blocks)))
+}
+
+/// 后台线程:发请求、读流、把增量塞进 channel。
+///
+/// **这里绝对不能碰任何 Slint 对象** —— 跨线程访问 UI 会 panic 或数据竞争。
+/// 所有界面更新都在主线程的 `State::poll_chat` 里做。
+fn run_chat(
+    cfg: model::AiConfig,
+    messages: Vec<ai::Message>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<ChatEvent>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let url = ai::endpoint(&cfg.base_url);
+    let agent = ureq::Agent::config_builder()
+        // 非 2xx 不当异常抛出:要能把服务端返回的那段 JSON 读出来给人看,
+        // 不然用户只能看到「请求失败」而不知道是密钥错了还是模型名错了
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_recv_response(Some(Duration::from_secs(60)))
+        // 兜底总时长。**它不是空闲超时** —— ureq 文档写明了「预算不按每次读重置」,
+        // 所以给得宽松些;真想中断,用户点停止(那是另一条路,见 cancel)。
+        .timeout_recv_body(Some(Duration::from_secs(300)))
+        .build()
+        .new_agent();
+
+    let body = ai::request_body(&cfg.model, &messages, true);
+    let sent = agent
+        .post(&url)
+        .header("Authorization", &format!("Bearer {}", cfg.api_key))
+        // Azure OpenAI 认的是这个头(它不认 Bearer);OpenAI 和中转站会忽略多余的头。
+        // 两个一起发,用户就不用先搞清楚自己用的是哪一派。
+        .header("api-key", &cfg.api_key)
+        .header("Accept", "text/event-stream")
+        .send_json(&body);
+
+    let resp = match sent {
+        Ok(r) => r,
+        Err(err) => {
+            let _ = tx.send(ChatEvent::Failed(ai::friendly_error(&err.to_string())));
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // 不是流(或者压根是错误响应):整段读出来按普通 JSON 解析。
+    // 两种情况都会走到这儿:① 有的服务无视 stream:true 直接给完整响应;
+    // ② 密钥/模型/额度出错时返回的是一个 JSON 错误体而不是 SSE。
+    if !status.is_success() || !ai::is_event_stream(&content_type) {
+        let mut resp = resp;
+        let raw = resp.body_mut().read_to_string().unwrap_or_default();
+        match ai::parse_full_response(&ai::truncate(&raw, 2000)) {
+            Ok(answer) => {
+                let _ = tx.send(ChatEvent::Delta(answer));
+                let _ = tx.send(ChatEvent::Done);
+            }
+            Err(msg) => {
+                let _ = tx.send(ChatEvent::Failed(ai::friendly_error(&format!(
+                    "HTTP {status}: {msg}"
+                ))));
+            }
+        }
+        return;
+    }
+
+    // SSE:逐行读。
+    //
+    // **用 lines() 而不是自己按 chunk 切**:网络分块不会对齐到换行,一个
+    // `data: {...}` 完全可能被拆在两个 TCP 包里。参考项目里直接 `split("\n\n")`
+    // 就是这么出 bug 的(而且很难复现)。lines() 自带缓冲,正好解决这件事。
+    let reader = resp.into_body().into_reader();
+    for line in std::io::BufReader::new(reader).lines() {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(ChatEvent::Failed("已中断".into()));
+            return;
+        }
+        let Ok(line) = line else { break }; // 读断了就收尾,别把半截当成功
+        match ai::parse_sse_line(&line) {
+            ai::Chunk::Text(t) => {
+                if tx.send(ChatEvent::Delta(t)).is_err() {
+                    return; // 主线程那边不要了(窗口关了),直接收工
+                }
+            }
+            ai::Chunk::Done => break,
+            ai::Chunk::Error(e) => {
+                let _ = tx.send(ChatEvent::Failed(ai::friendly_error(&e)));
+                return;
+            }
+            ai::Chunk::Ignore => {}
+        }
+    }
+    let _ = tx.send(ChatEvent::Done);
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -1982,6 +2955,27 @@ fn main() -> Result<(), slint::PlatformError> {
         ),
         pet_h: Cell::new(0.0),
         repaint_timers: RefCell::new(Vec::new()),
+        chat: RefCell::new(None),
+        chat_model: Rc::new(VecModel::default()),
+        chat_history: RefCell::new(Vec::new()),
+        chat_busy: Cell::new(false),
+        chat_status: RefCell::new(String::new()),
+        chat_cancel: RefCell::new(None),
+        chat_rx: RefCell::new(None),
+        chat_timer: RefCell::new(None),
+        chat_scroll_tick: Cell::new(0),
+        chat_config_open: Cell::new(false),
+        notes: RefCell::new(None),
+        notes_path: model::notes_file(),
+        notes_dirty: Cell::new(false),
+        notes_status: RefCell::new(String::new()),
+        notes_blocks: Rc::new(VecModel::default()),
+        notes_last_source: RefCell::new(String::new()),
+        notes_tick: Cell::new(0),
+        notes_timer: RefCell::new(None),
+        pet_click_timer: RefCell::new(None),
+        chat_cfg: RefCell::new(model::load_ai(&model::ai_config_file())),
+        chat_cfg_path: model::ai_config_file(),
     });
 
     // 滚轮惯性用的自引用 + 定时器。定时器**建好但不启动** ——
@@ -2220,11 +3214,25 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 {
                     let s = state.clone();
+                    pet.global::<Logic>().on_pet_clicked(move || s.pet_clicked());
+                }
+                {
+                    let s = state.clone();
+                    pet.global::<Logic>()
+                        .on_pet_double_clicked(move || s.pet_double_clicked());
+                }
+                {
+                    let s = state.clone();
+                    pet.global::<Logic>()
+                        .on_pet_badge_clicked(move || s.pet_badge_clicked());
+                }
+                {
+                    let s = state.clone();
                     pet.global::<Logic>().on_add_quick_task(move |title| s.add_quick_task(&title));
                 }
                 {
                     let s = state.clone();
-                    pet.global::<Logic>().on_show_main_window(move || s.show_main_window());
+                    pet.global::<Logic>().on_open_chat(move || s.open_chat());
                 }
                 {
                     let s = state.clone();
@@ -2258,6 +3266,79 @@ fn main() -> Result<(), slint::PlatformError> {
             timer.start(TimerMode::Repeated, PET_TICK, move || s.tick_pet());
             *state.pet_timer.borrow_mut() = Some(timer);
         }
+    }
+
+    // ── AI 对话窗口 ──
+    // 又是独立窗口,同样有自己那份 AppData / Logic,回调要单独接。
+    match ChatWindow::new() {
+        Ok(chat) => {
+            {
+                let s = state.clone();
+                chat.global::<Logic>().on_chat_send(move |text| s.start_chat(&text));
+            }
+            {
+                let s = state.clone();
+                chat.global::<Logic>().on_chat_cancel(move || s.cancel_chat());
+            }
+            {
+                let s = state.clone();
+                chat.global::<Logic>().on_chat_close(move || s.close_chat());
+            }
+            {
+                let s = state.clone();
+                chat.global::<Logic>()
+                    .on_chat_toggle_config(move || s.toggle_chat_config());
+            }
+            {
+                let s = state.clone();
+                chat.global::<Logic>().on_chat_save_config(move |base, key, model| {
+                    s.save_chat_config(&base, &key, &model)
+                });
+            }
+            {
+                // 对话窗标题栏那个「笔记」按钮
+                let s = state.clone();
+                chat.global::<Logic>().on_md_open(move || s.open_notes());
+            }
+            {
+                // AI 回复旁边的「存到笔记」
+                let s = state.clone();
+                chat.global::<Logic>()
+                    .on_md_append(move |text| s.append_to_notes(&text));
+            }
+            // 点 ✕ 只是藏起来(聊天记录留着)
+            chat.window().on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+            *state.chat.borrow_mut() = Some(Rc::new(chat));
+        }
+        Err(err) => platform::log(&format!("创建对话窗口失败,双击桌宠将没反应: {err}")),
+    }
+
+    // ── Markdown 草稿本窗口 ──
+    match NotesWindow::new() {
+        Ok(notes) => {
+            {
+                let s = state.clone();
+                notes.global::<Logic>().on_md_save(move || s.save_notes());
+            }
+            {
+                let s = state.clone();
+                notes.global::<Logic>().on_md_close(move || s.close_notes());
+            }
+            {
+                let s = state.clone();
+                notes.global::<Logic>().on_md_open(move || s.open_notes());
+            }
+            // 点 ✕ 也走「先存再藏」那条路(别让用户白写)
+            {
+                let s = state.clone();
+                notes.window().on_close_requested(move || {
+                    s.save_notes();
+                    slint::CloseRequestResponse::HideWindow
+                });
+            }
+            *state.notes.borrow_mut() = Some(Rc::new(notes));
+        }
+        Err(err) => platform::log(&format!("创建笔记窗口失败: {err}")),
     }
 
     // 主题(亮暗 + 外观)推给**所有**窗口。必须放在设置窗口建好之后。
@@ -2297,13 +3378,13 @@ fn main() -> Result<(), slint::PlatformError> {
     // 藏起来 —— 托盘图标是 tray-icon crate 建的,Slint 并不知道它的存在,所以
     // 用 ui.run() 的话关窗就等于退出进程,托盘常驻就废了。
     // 退出的唯一入口是托盘菜单里的「退出」。
-    state.reveal(&ui)?;
+    state.reveal(&ui, platform::WINDOW_TITLE)?;
 
     // 桌宠:先摆好位置再显示,免得先在屏幕中间闪一下
     if let Some(pet) = state.pet.borrow().clone().filter(|_| state.show_pet.get()) {
         state.push_pet();
         state.layout_pet_window();
-        if let Err(err) = state.reveal(&*pet) {
+        if let Err(err) = state.reveal(&*pet, platform::PET_TITLE) {
             platform::log(&format!("显示桌宠窗口失败: {err}"));
         }
         // 挂件不该占任务栏格子;和设置窗口同样的道理 —— winit 之后还会写窗口属性,

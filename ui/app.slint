@@ -16,6 +16,8 @@ import { CalendarView } from "calendar.slint";
 import { WeekView } from "week.slint";
 import { SettingsWindow } from "settings.slint";
 import { PetWindow } from "pet.slint";
+import { ChatWindow } from "chat.slint";
+import { NotesWindow } from "notes.slint";
 
 // 从别的文件再导出:Slint 只把**主文件**里可见的类型/全局当作公开 API,
 // 不加这几行的话 Rust 侧就看不到它们(Rust 里会只给个 deprecated 别名)。
@@ -27,6 +29,10 @@ export {
 export { SettingsWindow } from "settings.slint";
 // 桌宠也是独立窗口,同样要从主文件导出 Rust 才拿得到
 export { PetWindow } from "pet.slint";
+// AI 对话窗也是(双击桌宠弹出来的那个)
+export { ChatWindow } from "chat.slint";
+// Markdown 草稿本(从对话窗标题栏打开)
+export { NotesWindow } from "notes.slint";
 
 // ── 列表里的一行 ──────────────────────────────────────────────────────
 

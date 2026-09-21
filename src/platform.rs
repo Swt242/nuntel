@@ -18,6 +18,11 @@ pub const SETTINGS_TITLE: &str = "待办清单 · 设置";
 /// 桌宠窗口标题。跟 `ui/pet.slint` 里 `PetWindow.title` 一致。
 /// 同样带上应用名避免和别的程序撞名,而且它也不进任务栏,标题不会被看到。
 pub const PET_TITLE: &str = "待办清单 · 桌宠";
+/// AI 对话窗口的标题(用来 FindWindow 找窗口)
+pub const CHAT_TITLE: &str = "待办清单 · 助手";
+
+/// Markdown 草稿本窗口的标题。跟 `ui/notes.slint` 里 `NotesWindow.title` 一致。
+pub const NOTES_TITLE: &str = "待办清单 · 笔记";
 
 /// 开机自启在注册表里的值名
 const AUTOSTART_VALUE: &str = "rgui-todo";
@@ -391,6 +396,72 @@ pub fn bring_to_front(title: &str) {
                 ShowWindow(hwnd as _, SW_RESTORE);
                 SetForegroundWindow(hwnd as _);
             }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+    }
+}
+
+/// 窗口是不是被最小化(缩进任务栏)了。
+///
+/// 用 `IsIconic` **直接问系统**,不用 Slint 的 `Window::is_minimized()` —— 那个值
+/// 跟着 winit 事件更新,「刚调完还原、事件还没走完一轮」的时候读到的还是 true。
+/// 宿主正是在那种时刻需要马上做判断(见 `State::reveal`)。
+pub fn is_minimized(title: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsIconic;
+        let hwnd = hwnd_by_title(title);
+        if hwnd == 0 {
+            return false; // 窗口还没建出来,谈不上最小化
+        }
+        // SAFETY: 句柄来自 FindWindowW
+        unsafe { IsIconic(hwnd as _) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+        false
+    }
+}
+
+/// 把最小化的窗口还原回来。
+///
+/// **只在真的最小化时才调。** `SW_RESTORE` 对**最大化**的窗口同样是"还原"
+/// (MSDN 原话:如果窗口是最小化或最大化,系统都会把它恢复成原大小和位置),
+/// 所以不能拿它当"顺便激活一下"用 —— 用户最大化着主窗口,点个红点,
+/// 窗口反而被缩回去了。
+pub fn restore_window(title: &str) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindow};
+        let hwnd = hwnd_by_title(title);
+        if hwnd != 0 {
+            // SAFETY: 句柄来自 FindWindowW
+            unsafe { ShowWindow(hwnd as _, SW_RESTORE) };
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+    }
+}
+
+/// 把窗口叫到前台,**但不改变它的大小状态**:最大化的保持最大化,普通大小的保持原样。
+///
+/// 项目里另有一个 `bring_to_front`,它用的是 `SW_RESTORE` —— 那个是给
+/// 「自己弹出来的小窗」(对话/笔记/设置)用的,它们无所谓最大化;主窗口不行,
+/// 见 `restore_window` 的说明。要还原最小化的窗口请先调 `restore_window`。
+pub fn focus_window(title: &str) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+        let hwnd = hwnd_by_title(title);
+        if hwnd != 0 {
+            // SAFETY: 句柄来自 FindWindowW
+            unsafe { SetForegroundWindow(hwnd as _) };
         }
     }
     #[cfg(not(windows))]

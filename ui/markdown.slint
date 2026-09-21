@@ -1,0 +1,172 @@
+// Markdown 块的渲染 —— 草稿本预览和对话里的 AI 回复共用这一个组件。
+//
+// 从 notes.slint 里抽出来的:两处都要画同一套块,抽出来才不会出现
+// 「草稿本里渲染对了、对话里又不对」。
+//
+// 分工见 src/markdown.rs 顶部:Rust 切块级,行内样式交给 Slint 的 StyledText。
+
+import { MdBlock, MdCell, MdKind, Theme } from "widgets.slint";
+
+/// 一块的渲染。
+///
+/// ⚠️ 两条都踩过,别改回去:
+///
+/// 1. **高度必须自己算**。这是个普通 Rectangle,子元素全是绝对定位,布局问它
+///    「你要多高」时它答不上来(给 0),结果所有块叠在一起。
+/// 2. **子元素不能写在 `if ... :` 里面**。条件会给元素套一层隐式父级,
+///    外层作用域就引用不到它们的 id —— `height: rich-text.preferred-height` 会
+///    直接编译报 `Cannot access id`。所以这里**无条件声明**,用 `visible` 控制显示;
+///    id 同作用域,高度才引用得到。
+export component MdBlockView inherits Rectangle {
+    in property <MdBlock> block: { kind: MdKind.rich, text: @markdown(""), raw: "", lang: "", level: 1, cells: [] };
+
+    background: transparent;
+    // 内容高度 + 块之间那点间距(各元素统一从 y=0 开始)
+    height: block.kind == MdKind.rich ? rich-text.preferred-height + 16px
+        : block.kind == MdKind.heading ? heading-text.preferred-height + 16px
+        : block.kind == MdKind.code ? code-box.height + 10px
+        : block.kind == MdKind.quote ? quote-text.preferred-height + 18px
+        : block.kind == MdKind.table ? table-box.height + 10px
+        : 21px;
+
+    // ── 段落 / 列表(行内样式交给 StyledText)──
+    rich-text := StyledText {
+        visible: block.kind == MdKind.rich;
+        text: block.text;
+        // ⚠️ **换字体是为了行高**,不是为了字形好看。
+        //
+        // Slint 1.18 的 `StyledText` **没有 `line-height-factor`**(只有 `Text` /
+        // `TextInput` 有),而它不支持标题/代码块/表格,所以这些块离不开它。
+        // 行高是按**主字体的 ascent+descent** 算的:默认的 Segoe UI 只有约 1.14 倍,
+        // 中文读起来挤成一团(实测行距 16px / 字号 14px)。微软雅黑约 1.35 倍,
+        // 换过去直接宽了一圈 —— 这是当前版本唯一能调行高的杠杆。
+        default-font-family: "Microsoft YaHei";
+        default-color: Theme.text;
+        link-color: Theme.accent-ink;
+        width: parent.width;
+        height: self.preferred-height;
+        x: 0;
+        y: 0;
+    }
+
+    // ── 标题:用 Text 而不是 StyledText —— 只有 Text 能调字号/字重,
+    //    StyledText 没这两个属性。代价是标题里的行内样式不生效(很少见)
+    heading-text := Text {
+        visible: block.kind == MdKind.heading;
+        text: block.raw;
+        font-size: block.level == 1 ? 22px
+            : block.level == 2 ? 19px
+            : block.level == 3 ? 16px
+            : 14px;
+        font-weight: 700;
+        color: Theme.text;
+        wrap: word-wrap;
+        width: parent.width;
+        x: 0;
+        y: 6px;
+    }
+
+    // ── 代码块:等宽 + 底色,**原样纯文本**(代码里的 * 不能被当强调标记)──
+    code-box := Rectangle {
+        visible: block.kind == MdKind.code;
+        width: parent.width;
+        x: 0;
+        y: 5px;
+        height: code-text.preferred-height + 16px;
+        border-radius: 8px * Theme.radius-scale;
+        background: Theme.inset;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        code-text := Text {
+            text: block.raw;
+            width: parent.width - 20px;
+            x: 10px;
+            y: 8px;
+            font-family: "Consolas";
+            font-size: 12px;
+            color: Theme.text;
+            // 代码**不折行**:折了就看不出缩进结构,超宽部分裁掉
+            wrap: no-wrap;
+            overflow: elide;
+        }
+    }
+
+    // ── 引用 ──
+    quote-text := StyledText {
+        visible: block.kind == MdKind.quote;
+        text: block.text;
+        default-color: Theme.text-dim;
+        link-color: Theme.accent-ink;
+        width: parent.width - 14px;
+        x: 12px;
+        y: 4px;
+        height: self.preferred-height;
+
+        // 左边那道竖线(引用块的标准长相)
+        Rectangle {
+            x: -12px;
+            y: 0;
+            width: 3px;
+            height: parent.height;
+            border-radius: 1px;
+            background: Theme.accent-ink.with-alpha(0.5);
+        }
+    }
+
+    // ── 分隔线 ──
+    rule-bar := Rectangle {
+        visible: block.kind == MdKind.rule;
+        width: parent.width;
+        height: 1px;
+        y: 10px;
+        background: Theme.border;
+    }
+
+    // ── 表格 ──
+    //
+    // StyledText 不支持表格,所以单元格是**在 Rust 侧切好的**(见 markdown.rs),
+    // 这里用 GridLayout 摆成真网格 —— 列能对齐、表头有底色,比等宽文本块好读得多。
+    // 代价是单元格里的行内样式不生效(单元格是纯 Text),这一点与标题同理。
+    //
+    // 列宽按内容自适应(hug):想让它们铺满整宽得逐列算,不值得;表格通常也不长。
+    table-box := Rectangle {
+        visible: block.kind == MdKind.table;
+        width: parent.width;
+        x: 0;
+        y: 5px;
+        height: table-grid.preferred-height + 16px;
+        border-radius: 8px * Theme.radius-scale;
+        background: Theme.inset;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        table-grid := GridLayout {
+            x: 8px;
+            y: 8px;
+            width: parent.width - 16px;
+            // 1px 的缝配合格子自己的边框色,就成了一张表
+            spacing: 1px;
+
+            // 单元格是扁平的一维模型,靠 row/column 显式定位 —— 列就能对齐
+            for cell in block.cells : Rectangle {
+                row: cell.row;
+                col: cell.col;   // 注意是 col 不是 column(Slint 的 GridLayout 用 col)
+                background: cell.header ? Theme.accent-soft : transparent;
+
+                // padding 只能加在布局元素上(直接写给 Text 会被警告且无效),所以套一层
+                HorizontalLayout {
+                    padding: 6px;
+                    Text {
+                        text: cell.text;
+                        font-size: 12px;
+                        font-weight: cell.header ? 600 : 400;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
+

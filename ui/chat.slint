@@ -1,0 +1,477 @@
+// AI 对话窗口 —— 双击桌宠弹出来的那个。
+//
+// 几个决定:
+//
+// 1. **独立窗口,不是把桌宠窗口撑大**。桌宠是 240×130 的小挂件,对话要能滚动、
+//    能输入多轮,撑大它会把「宠物本体」和「对话」两件事绑死在一个窗口的尺寸里。
+//    独立窗口还能单独摆位置(见宿主 State::layout_chat_window:优先放宠物右边,
+//    右边放不下就翻到左边)。
+// 2. **不置顶**。桌宠置顶是因为它是个小挂件;对话窗是个正常窗口,置顶会一直压着
+//    别的程序。它摆在宠物**旁边**(不重叠),所以不需要靠置顶来避免被宠物盖住。
+// 3. 流式回复时最后一条消息的 `streaming` 为真,尾巴上挂一个光标方块。
+//
+// ⚠️ 老规矩:这个窗口有自己的一份 Theme / AppData / Logic(全局单例不跨窗口共享),
+// 宿主必须单独推数据、单独接回调 —— 见 main.rs 里 PetWindow 旁边那段。
+
+import { ScrollView } from "std-widgets.slint";
+import { MdBlockView } from "markdown.slint";
+import {
+    AppData, Backdrop, ChatMsg, ChatWho, IconButton, Logic, MdKind, PanelEdge, Theme,
+    TextButton, VCenter, WindowButton,
+} from "widgets.slint";
+
+/// 一条消息。气泡宽度跟着文字走,但不超过行宽的 82%。
+///
+/// 尺寸不能成环:气泡宽 ← 文字的 preferred-width(单行所需宽度,不依赖自身宽度),
+/// 气泡高 ← 文字的 preferred-height(换行后高度,依赖宽度)。这条链是单向的,
+/// 所以「宽度不定 + 高度自适应」在 Slint 里是能做的 —— 前提是别写成 self.height 参与布局。
+component Bubble inherits Rectangle {
+    in property <string> text;
+    in property <ChatWho> who;
+    in property <bool> streaming: false;
+    /// 这一行能用的总宽度。**必须由调用方传**:组件**根元素**访问不到 `parent`
+    /// (嵌套在里面的子元素才行),所以宽度的来源只能从外面给。
+    in property <length> avail-w: 320px;
+    /// 气泡最大宽度 = 行宽的 82%
+    property <length> max-w: avail-w * 0.82;
+
+    property <bool> mine: who == ChatWho.user;
+    property <bool> note: who == ChatWho.note;
+
+    width: note ? avail-w - 16px : min(label.preferred-width + 20px, max-w);
+    height: label.preferred-height + 16px;
+    // 自己的消息靠右,对方靠左,系统提示居中铺满
+    x: note ? 8px : (mine ? avail-w - self.width - 8px : 8px);
+    y: 3px;
+    border-radius: 10px * Theme.radius-scale;
+    background: note ? transparent
+        : (mine ? Theme.accent : Theme.card);
+    border-width: note ? 0px : 1px;
+    border-color: mine ? transparent : Theme.border;
+    drop-shadow-color: mine || note ? transparent : Theme.shadow;
+    drop-shadow-blur: 6px;
+    drop-shadow-offset-y: 2px;
+
+    label := Text {
+        text: root.streaming ? root.text + "▍" : root.text;
+        width: parent.width - 20px;
+        x: 10px;
+        y: 8px;
+        wrap: word-wrap;
+        font-size: note ? 11px : 13px;
+        color: note ? Theme.text-dim
+            : (mine ? Theme.accent-fg : Theme.text);
+        horizontal-alignment: note ? center : left;
+    }
+}
+
+/// 带边框的输入框。
+///
+/// **`TextInput` 自己不画边框** —— 它只有文字和光标,`border-radius`/`background`
+/// 这些属性在它身上根本不存在(直接写会编译报错)。所以外面必须套一层 Rectangle,
+/// 项目里其它输入框也都是这么干的(见 ui/app.slint 的编辑态输入框)。
+component Field inherits Rectangle {
+    in-out property <string> text;
+    in property <bool> secret: false;
+    in property <string> hint;
+
+    height: hint == "" ? 28px : 44px;
+    background: transparent;
+
+    Rectangle {
+        width: parent.width;
+        height: 28px;
+        border-radius: 8px * Theme.radius-scale;
+        background: Theme.inset;
+        border-width: 1px;
+        // 聚焦时描一圈强调色,不然在一堆同色输入框里看不出光标在哪
+        border-color: input.has-focus ? Theme.accent-ink : Theme.border;
+
+        input := TextInput {
+            text <=> root.text;
+            single-line: true;
+            font-size: 12px;
+            color: Theme.text;
+            vertical-alignment: center;
+            input-type: root.secret ? InputType.password : InputType.text;
+            x: 8px;
+            width: parent.width - 16px;
+            height: parent.height;
+        }
+    }
+
+    if hint != "" : Text {
+        text: root.hint;
+        font-size: 10px;
+        color: Theme.text-dim;
+        y: 31px;
+        width: parent.width;
+        wrap: word-wrap;
+    }
+}
+
+export component ChatWindow inherits Window {
+    title: "待办清单 · 助手";
+    // 固定尺寸:对话窗跟着宠物摆位置,能缩放反而不好摆
+    width: 400px;
+    height: 520px;
+    background: Theme.bg;
+    no-frame: true;
+    icon: @image-url("icons/app.svg");
+    default-font-size: 14px;
+
+    Backdrop {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    // ── 标题栏 ──
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 36px;
+        background: Theme.card;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        PanelEdge { width: parent.width - 2px; }
+
+        move-area := WindowMoveArea {
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 4px;
+                spacing: 8px;
+
+                Text {
+                    text: "助手";
+                    font-size: 12px;
+                    color: Theme.text;
+                    vertical-alignment: center;
+                }
+                Text {
+                    // 用哪个模型一眼能看到,配错了不用打开设置
+                    text: AppData.chat-model;
+                    font-size: 11px;
+                    color: Theme.text-dim;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+
+                VCenter {
+                    // 打开 Markdown 草稿本
+                    chat-note := IconButton {
+                        icon: @image-url("icons/note.svg");
+                        icon-size: 16px;
+                        clicked => { Logic.md-open(); }
+                    }
+                }
+                VCenter {
+                    chat-gear := IconButton {
+                        icon: @image-url("icons/settings.svg");
+                        icon-size: 15px;
+                        clicked => { Logic.chat-toggle-config(); }
+                    }
+                }
+                VCenter {
+                    VCenter {
+                        chat-close := WindowButton {
+                            icon: @image-url("icons/win-close.svg");
+                            danger: true;
+                            clicked => { Logic.chat-close(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 绑定设置(盖在消息区上,点齿轮开关)──
+    if AppData.chat-config-open : Rectangle {
+        x: 8px;
+        y: 42px;
+        width: parent.width - 16px;
+        // 高度按内容量出来的:上下内边距 24 + 标题 16 + 3 个「输入框+说明」44×3
+        // + 6 个间距 48 + 按钮行 30 ≈ 250。给矮了会全都压在一起(实测 210 就是这样)。
+        height: 258px;
+        border-radius: 12px * Theme.radius-scale;
+        // 用 sheet 不用 card:它压在消息上,太透会「字压字」(同主窗口浮层的道理)
+        background: Theme.sheet;
+        border-width: 1px;
+        border-color: Theme.accent-ink;
+        drop-shadow-color: Theme.shadow;
+        drop-shadow-blur: 18px;
+        drop-shadow-offset-y: 6px;
+
+        VerticalLayout {
+            padding: 12px;
+            spacing: 8px;
+
+            Text {
+                text: "接口设置";
+                font-size: 12px;
+                font-weight: 600;
+                color: Theme.text;
+            }
+
+            cfg-base := Field {
+                text <=> AppData.chat-base-url;
+                hint: "接口地址,例如 https://api.openai.com/v1(补 /chat/completions 由程序来)";
+            }
+            cfg-key := Field {
+                text <=> AppData.chat-api-key;
+                secret: true;
+                hint: "密钥,明文存在数据目录里的 ai.json(**没有加密**)";
+            }
+            cfg-model := Field {
+                text <=> AppData.chat-model;
+                hint: "模型名,例如 gpt-4o-mini / deepseek-chat";
+            }
+
+            HorizontalLayout {
+                alignment: end;
+                spacing: 6px;
+
+                VCenter {
+                    cfg-cancel := TextButton {
+                        label: "取消";
+                        clicked => { Logic.chat-toggle-config(); }
+                    }
+                }
+                VCenter {
+                    cfg-save := TextButton {
+                        label: "保存";
+                        clicked => {
+                            Logic.chat-save-config(
+                                AppData.chat-base-url,
+                                AppData.chat-api-key,
+                                AppData.chat-model,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 把宿主的「消息变了」信号转成本窗口的属性。
+    ///
+    /// 不能直接写 `changed AppData.chat-scroll-tick => ...` —— 那个语法只认
+    /// 本元素的属性,对 global 的属性不成立(编译报 expected '=>')。
+    /// 用一个本地属性接一下,`changed` 就能挂在它上面。
+    property <int> scroll-tick: AppData.chat-scroll-tick;
+    changed scroll-tick => {
+        chat-scroll.content-y = chat-scroll.content-height;
+    }
+
+    // ── 消息区 ──
+    chat-scroll := ScrollView {
+        // 不画滚动条。理由:这是 std-widgets 的 Fluent 样式滚动条,**跟系统调色板**,
+        // 在本应用自己画的一套外观里非常突兀(亮色下滑块是灰的、圆角也不一样)。
+        // 关掉之后滚轮/触控板照样能滚,只是看不到滑块。
+        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+        x: 0;
+        y: 36px;
+        width: parent.width;
+        height: parent.height - 36px - 52px;
+
+        VerticalLayout {
+            // 显式给宽度:不给的话 ScrollView 会从内容反推可滚宽度,和里面那些
+            // 按宽度换行的文字绕成绑定环(在 notes.slint 上踩过同一个坑)。
+            // 用 visible-width 而不是 width,理由同 notes.slint:
+            // 按 width 给会把换行点算到可视区外,每行最后一个字被切掉半截。
+            width: chat-scroll.visible-width;
+            padding-top: 8px;
+            padding-bottom: 8px;
+
+            // Text 本身没有 margin/padding 属性,要留白就外面套一层带 padding 的布局
+            if AppData.chat-messages.length == 0 : HorizontalLayout {
+                padding: 16px;
+                Text {
+                    text: "双击桌宠就能找我聊天。第一次要先在右上角齿轮里填接口地址、密钥和模型名。";
+                    font-size: 12px;
+                    color: Theme.text-dim;
+                    wrap: word-wrap;
+                }
+            }
+
+            for msg in AppData.chat-messages : Rectangle {
+                // 行高由内容决定;行的宽度来自外层布局,和高度无关 —— 不成环
+                height: msg.who == ChatWho.assistant ? ai-col.height + 8px : bubble.height + 6px;
+                background: transparent;
+
+                // **助手消息走 Markdown 渲染,而且不进气泡**。
+                // 理由:气泡宽度是跟着文字算的(≤82%),而 Markdown 里的代码块/表格
+                // 需要尽可能宽才好读。整块平铺更像正经的 Markdown 阅读器。
+                //
+                // ⚠️ 两个变体都**无条件声明**,用 `visible` 控制 —— 写成 `if ... : Rectangle`
+                // 的话外层引不到里面的 id,上面那行 height 就编译不过
+                // (条件会给元素套一层隐式父级,这个坑在 notes.slint 里也踩过)。
+                ai-col := VerticalLayout {
+                    visible: msg.who == ChatWho.assistant;
+                    width: parent.width - 16px;
+                    // 高度取自己的首选高度 —— **不能让它默认成 parent.height**,
+                    // 那样和外面那行「行高 = ai-col.height + 8」绕成绑定环(实测报
+                    // `height -> ai-col.height -> height`)。布局元素要按内容撑开就得写这句。
+                    height: self.preferred-height;
+                    x: 8px;
+                    y: 4px;
+                    spacing: 0;
+
+                    for b in msg.blocks : MdBlockView {
+                        block: b;
+                        // 同理:写 width: parent.width 会把布局的 padding 算漏
+                        horizontal-stretch: 1;
+                    }
+
+                    // 流式时最后挂个光标,表示还在往外蹦字
+                    if msg.streaming : Text {
+                        text: "▍";
+                        color: Theme.accent-ink;
+                        font-size: 13px;
+                    }
+
+                    // 写完了才给「存到笔记」——流到一半存进去是半截内容。
+                    // 存的是**原始 Markdown**(msg.text),所以进笔记之后还能接着编辑
+                    if !msg.streaming && msg.text != "" : HorizontalLayout {
+                        height: 24px;
+                        alignment: start;
+
+                        VCenter {
+                            md-keep := TextButton {
+                                label: "存到笔记";
+                                clicked => { Logic.md-append(msg.text); }
+                            }
+                        }
+                    }
+                }
+
+                bubble := Bubble {
+                    text: msg.text;
+                    who: msg.who;
+                    visible: msg.who != ChatWho.assistant;
+                    streaming: msg.streaming;
+                    // 这一层还在布局里,parent 可用;Bubble 里面就用不了了
+                    avail-w: parent.width;
+                }
+            }
+
+            // 等第一个字的时候至少有个动静(Slint 没有 `else if`,这里拆成两个 if)
+            if AppData.chat-busy : HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-bottom: 4px;
+                Text {
+                    text: AppData.chat-status;
+                    font-size: 11px;
+                    color: Theme.text-dim;
+                }
+            }
+            // 不忙的时候还留着 status,说明那是错误信息
+            if !AppData.chat-busy && AppData.chat-status != "" : HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-bottom: 4px;
+                Text {
+                    text: AppData.chat-status;
+                    font-size: 11px;
+                    color: Theme.danger;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // ── 输入区 ──
+    Rectangle {
+        x: 0;
+        y: parent.height - 52px;
+        width: parent.width;
+        height: 52px;
+        background: Theme.card;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        HorizontalLayout {
+            padding: 8px;
+            spacing: 8px;
+
+            // 输入框:套一层画边框(TextInput 自己没有边框属性)
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 36px;
+                border-radius: 10px * Theme.radius-scale;
+                background: Theme.inset;
+                border-width: 1px;
+                border-color: chat-input.has-focus ? Theme.accent-ink : Theme.border;
+
+                chat-input := TextInput {
+                    text <=> AppData.chat-draft;
+                    single-line: true;
+                    font-size: 13px;
+                    color: Theme.text;
+                    vertical-alignment: center;
+                    enabled: !AppData.chat-busy;
+                    x: 10px;
+                    width: parent.width - 20px;
+                    height: parent.height;
+
+                    // 打开就聚焦(和桌宠那个快速添加一致)
+                    init => { self.focus(); }
+
+                    accepted => {
+                        if (!AppData.chat-draft.is-empty && !AppData.chat-busy) {
+                            Logic.chat-send(AppData.chat-draft);
+                        }
+                    }
+                    // 只接管 Esc;其余按键必须 reject,否则输入法/编辑键会被吃掉
+                    key-pressed(ev) => {
+                        if (ev.text == Key.Escape) {
+                            Logic.chat-close();
+                            accept
+                        } else {
+                            reject
+                        }
+                    }
+                }
+
+                // 空且没聚焦时自己画占位(TextInput 没有 placeholder)
+                if AppData.chat-draft.is-empty && !chat-input.has-focus : Text {
+                    text: AppData.chat-busy ? "正在回复…" : "说点什么…";
+                    color: Theme.text-dim;
+                    font-size: 13px;
+                    x: 10px;
+                    y: (parent.height - self.height) / 2;
+                }
+            }
+
+            VCenter {
+                chat-send := IconButton {
+                    icon: @image-url("icons/send.svg");
+                    icon-size: 17px;
+                    // 忙的时候变成「停止」,点它中断这次生成
+                    danger: AppData.chat-busy;
+                    clicked => {
+                        if (AppData.chat-busy) {
+                            Logic.chat-cancel();
+                        } else if (!AppData.chat-draft.is-empty) {
+                            Logic.chat-send(AppData.chat-draft);
+                        }
+                    }
+                }
+            }
+            if AppData.chat-busy : VCenter {
+                stop := IconButton {
+                    icon: @image-url("icons/x.svg");
+                    icon-size: 15px;
+                    danger: true;
+                    clicked => { Logic.chat-cancel(); }
+                }
+            }
+        }
+    }
+}

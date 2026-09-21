@@ -243,6 +243,84 @@ pub fn clamp_pet_speed(v: f32) -> f32 {
     if v.is_finite() { v.clamp(PET_SPEED_MIN, PET_SPEED_MAX) } else { PET_SPEED_DEFAULT }
 }
 
+// ── AI 对话的接口配置 ────────────────────────────────────────────────
+//
+// **故意单独一个文件**:密钥和待办数据放一起的话,用户想贴个 todos.json 让人看
+// 问题、或者哪天把数据目录同步到什么地方,密钥就跟着跑了。分开存至少不会顺手带出去。
+//
+// 也**没有用系统 keyring**:那会多一个 Windows 凭据管理器的依赖和一堆失败分支
+// (凭据服务被策略关掉、企业环境里不可用…),对一个本地小工具不划算。
+// 明文放在 %APPDATA% 下,权限跟其它用户数据一样 —— 界面上写明了这一点。
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct AiConfig {
+    /// 接口根地址,例如 https://api.openai.com/v1(补 /chat/completions 由 ai::endpoint 做)
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub model: String,
+}
+
+impl AiConfig {
+    /// 三项齐了才能发请求(缺哪项由界面提示)
+    pub fn is_ready(&self) -> bool {
+        self.missing().is_none()
+    }
+
+    /// 缺哪一项 —— 用来拼「还差 XXX」的提示
+    pub fn missing(&self) -> Option<&'static str> {
+        if self.base_url.trim().is_empty() {
+            Some("接口地址")
+        } else if self.api_key.trim().is_empty() {
+            Some("密钥")
+        } else if self.model.trim().is_empty() {
+            Some("模型名")
+        } else {
+            None
+        }
+    }
+}
+
+/// Markdown 草稿本的文件路径,和 todos.json 同一个目录。
+///
+/// **没做文件管理**:用户选的是「单草稿本」,一个文件、随手记,
+/// 所以不引文件对话框依赖、也不做笔记列表。
+pub fn notes_file() -> PathBuf {
+    data_file().with_file_name("notes.md")
+}
+
+/// AI 配置文件路径,和 todos.json 同一个目录
+pub fn ai_config_file() -> PathBuf {
+    data_file().with_file_name("ai.json")
+}
+
+/// 读 AI 配置。文件不在或内容坏了就给空配置(界面上会提示还没配好)。
+pub fn load_ai(path: &Path) -> AiConfig {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return AiConfig::default();
+    };
+    match serde_json::from_str(&text) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            crate::platform::log(&format!("{} 解析失败,当没配过处理: {err}", path.display()));
+            AiConfig::default()
+        }
+    }
+}
+
+/// 存 AI 配置。和待办一样:先写临时文件再改名,写一半崩了不会毁掉旧配置。
+pub fn save_ai(path: &Path, cfg: &AiConfig) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| format!("序列化失败: {e}"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建目录 {} 失败: {e}", dir.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| format!("写入 {} 失败: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("改名到 {} 失败: {e}", path.display()))
+}
+
 /// 数据文件路径:`%APPDATA%\rgui-todo\todos.json`(非 Windows 上退回 XDG/HOME)
 pub fn data_file() -> PathBuf {
     let base = std::env::var_os("APPDATA")

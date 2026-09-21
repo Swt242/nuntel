@@ -1,0 +1,180 @@
+// Markdown 草稿本 —— 左边源码、右边实时预览。
+//
+// 分工(见 src/markdown.rs 的顶部说明):
+// - 宿主把源码**切块**(标题/代码块/引用/分隔线/表格 Slint 的 StyledText 不认),
+//   行内样式交给 StyledText 自己按 CommonMark 解析;
+// - `raw` 那几块(代码、表格)走**等宽纯文本**,绝不过 StyledText ——
+//   否则代码里的 `*` 和下划线会被当成强调标记吃掉。
+//
+// ⚠️ 独立窗口,又是自己一份 AppData / Logic,宿主得单独推、单独接。
+
+import { ScrollView } from "std-widgets.slint";
+import { MdBlockView } from "markdown.slint";
+import {
+    AppData, Backdrop, Logic, MdKind, PanelEdge, Theme, TextButton,
+    VCenter, WindowButton,
+} from "widgets.slint";
+
+export component NotesWindow inherits Window {
+    title: "待办清单 · 笔记";
+    // 用 preferred-* 而不是 width/height:写 width 就是**固定尺寸**(窗口拉不动),
+    // 而且 Slint 不允许同时写 height 和 min-height。笔记窗要能拉大才好写长文。
+    preferred-width: 820px;
+    preferred-height: 560px;
+    min-width: 520px;
+    min-height: 320px;
+    background: Theme.bg;
+    no-frame: true;
+    resize-border-width: 6px;
+    icon: @image-url("icons/app.svg");
+    default-font-size: 14px;
+
+    Backdrop {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    // ── 标题栏 ──
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 36px;
+        background: Theme.card;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        PanelEdge { width: parent.width - 2px; }
+
+        move-area := WindowMoveArea {
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 4px;
+                spacing: 8px;
+
+                Text {
+                    text: "笔记";
+                    font-size: 12px;
+                    color: Theme.text;
+                    vertical-alignment: center;
+                }
+                Text {
+                    // 存哪了写出来,免得用户找不到文件
+                    text: AppData.md-status;
+                    font-size: 11px;
+                    color: AppData.md-dirty ? Theme.accent-ink : Theme.text-dim;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+
+                VCenter {
+                    md-save := TextButton {
+                        label: "保存";
+                        clicked => { Logic.md-save(); }
+                    }
+                }
+                VCenter {
+                    md-close := WindowButton {
+                        icon: @image-url("icons/win-close.svg");
+                        danger: true;
+                        clicked => { Logic.md-close(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 左:源码 / 右:预览 ──
+    Rectangle {
+        x: 0;
+        y: 36px;
+        width: parent.width / 2;
+        height: parent.height - 36px;
+        background: Theme.inset;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        md-input := TextInput {
+            text <=> AppData.md-source;
+            width: parent.width - 20px;
+            height: parent.height - 16px;
+            x: 10px;
+            y: 8px;
+            // 等宽 + 多行:Markdown 源码用比例字体根本没法看对齐
+            font-family: "Consolas";
+            font-size: 13px;
+            color: Theme.text;
+            single-line: false;
+            wrap: word-wrap;
+            init => { self.focus(); }
+
+            // Ctrl+S 保存;只接管这一个,其余按键必须 reject(不然编辑键/输入法会被吃)
+            key-pressed(ev) => {
+                if (ev.modifiers.control && (ev.text == "s" || ev.text == "S")) {
+                    Logic.md-save();
+                    accept
+                } else {
+                    reject
+                }
+            }
+        }
+
+        if AppData.md-source.is-empty : Text {
+            text: "# 在这里写 Markdown\n\n右边是实时预览。Ctrl+S 或右上角「保存」存盘,\n关窗口时会自动存一次。";
+            color: Theme.text-dim;
+            font-size: 13px;
+            x: 10px;
+            y: 8px;
+            width: parent.width - 20px;
+            wrap: word-wrap;
+        }
+    }
+
+    md-scroll := ScrollView {
+        // 不画滚动条。理由:这是 std-widgets 的 Fluent 样式滚动条,**跟系统调色板**,
+        // 在本应用自己画的一套外观里非常突兀(亮色下滑块是灰的、圆角也不一样)。
+        // 关掉之后滚轮/触控板照样能滚,只是看不到滑块。
+        vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+        horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+        x: parent.width / 2;
+        y: 36px;
+        width: parent.width - parent.width / 2;
+        height: parent.height - 36px;
+
+        // 宿主的「内容变了」信号 → 滚回顶部那一下由本地属性接(见 chat.slint 里同类写法)
+        property <int> blocks-tick: AppData.md-tick;
+
+        VerticalLayout {
+            // ⚠️ **必须显式给宽度**。不给的话 ScrollView 会从内容反推自己的可滚宽度,
+            // 而里面每个块又是 `width: parent.width` —— 绕一圈就成了绑定环
+            // (报错原文:layoutinfo-h -> min-width -> flickable.content-width -> width)。
+            // **用 `visible-width` 而不是 `width`**。ScrollView 的可视宽度比它自己的
+            // width 窄一些(给自己留了边距),按 width 给内容宽度的话换行点会落到可视区
+            // 之外 —— 每行最后一个字被切掉半截(实测:内容右边界顶到窗口边上)。
+            // `visible-width` 就是「可视区宽度(不含滚动条)」,拿它当换行宽度正好,
+            // 左右留白交给下面的 padding。
+            width: md-scroll.visible-width;
+            padding: 14px;
+            spacing: 2px;
+
+            if AppData.md-blocks.length == 0 : Text {
+                text: "预览";
+                color: Theme.text-dim;
+                font-size: 13px;
+            }
+
+            // 每块的高度由 MdBlockView 自己算(它知道内容多高),这里不要再加
+            // ⚠️ **不要写 `width: parent.width`**:那是布局的**整宽**,不含 padding ——
+            // 布局有 14px 内边距时,每块都会宽出 28px,换行点落到可视区外,
+            // 每行最后一个字被切掉半截(实测:文字右边界正好顶到窗口边)。
+            // 交给布局按内容宽度分(`horizontal-stretch`),内边距自然就扣掉了。
+            for b in AppData.md-blocks : MdBlockView {
+                block: b;
+                horizontal-stretch: 1;
+            }
+        }
+    }
+}

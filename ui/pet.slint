@@ -150,7 +150,38 @@ export component PetWindow inherits Window {
                         height: parent.height;
                     }
 
+                    // 单击 / 双击 / 拖动都归它。
+                    //
+                    // ⚠️ **单击不能就地执行**:双击的第一下也是单击,而单击会把
+                    // 快速添加输入条打开 —— 窗口跟着变高,Slint 的双击判定就此断掉,
+                    // 结果就是「双击打不开对话窗,反倒开了个输入条」(实测)。
+                    // 所以单击发给宿主之后**延迟 250ms** 再执行,这期间来了双击就取消。
+                    // 拖动**不会**顺带触发 clicked:TouchArea 的 clicked 只在
+                    // 「按下和松开都在本区域内」时发,真拖起来之后窗口跟着指针走,
+                    // 松手时指针还在宠物上 —— 所以那道判断交给宿主(见 State::pet_just_dragged)。
+                    pet-touch := TouchArea {
+                        mouse-cursor: pointer;
+
+                        changed pressed => {
+                            if (self.pressed) {
+                                Logic.pet-drag-begin(
+                                    self.absolute-position.x + self.mouse-x,
+                                    self.absolute-position.y + self.mouse-y,
+                                );
+                            } else {
+                                Logic.pet-drag-end();
+                            }
+                        }
+                        moved => { Logic.pet-drag-slide(); }
+                        double-clicked => { Logic.pet-double-clicked(); }
+                        clicked => { Logic.pet-clicked(); }
+                    }
+
                     // 未完成数角标。贴在右上角、允许溢出边界 —— clip 默认是关的,正好。
+                    //
+                    // **必须排在 pet-touch 后面**:Slint 里同层靠后的元素压在上面,
+                    // 也才先拿到鼠标事件。放在前面的话这一小块会被 pet-touch 盖住,
+                    // 点上去只会走到「展开输入条」那条路。
                     if AppData.pet-count > 0 : Rectangle {
                         width: badge-text.width + 12px;
                         height: 20px;
@@ -173,30 +204,38 @@ export component PetWindow inherits Window {
                             x: 6px;
                             y: (parent.height - self.height) / 2;
                         }
-                    }
 
-                    // 单击 / 双击 / 拖动都归它。拖动**不会**顺带触发 clicked:
-                    // TouchArea 的 clicked 只在「按下和松开都在本区域内」时发,
-                    // 真拖起来之后窗口跟着指针走,松手时指针还在宠物上——
-                    // 所以这道判断交给宿主(见 State::pet_just_dragged)。
-                    pet-touch := TouchArea {
-                        mouse-cursor: pointer;
+                        // 点红点 = 看这 N 条到底是什么。
+                        //
+                        // 拖动那几个回调也照接:只吃点击不认拖动的话,宠物的右上角
+                        // 会变成一块「按住拖不动」的死区(角标有 20px 高,宠物调小之后
+                        // 那一块并不小)。
+                        //
+                        // ⚠️ 基准点必须用 **`self.absolute-position`**,不能像旁边
+                        // pet-touch 那样写 `pet-body.absolute-position`。`mouse-x` 是
+                        // 相对**本元素**的 —— 这个 TouchArea 只有角标那么大,和 pet-body
+                        // 差着一个角标的偏移,加起来得到的指针位置就偏了。偏的后果不是
+                        // 「拖不动」而是**拖歪**:y 大致还对、x 直接反向(实测从红点拖
+                        // -150px,宠物反而往右挪了 9px)。pet-touch 正巧铺满 pet-body,
+                        // 两个写法等价,所以这个坑只有这里踩得到。
+                        TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            mouse-cursor: pointer;
 
-                        changed pressed => {
-                            if (self.pressed) {
-                                // mouse-x/y 是相对本 TouchArea 的,加上它在窗口里的
-                                // 绝对位置,才是宿主能用来和窗口坐标相加的基准点
-                                Logic.pet-drag-begin(
-                                    pet-body.absolute-position.x + self.mouse-x,
-                                    pet-body.absolute-position.y + self.mouse-y,
-                                );
-                            } else {
-                                Logic.pet-drag-end();
+                            changed pressed => {
+                                if (self.pressed) {
+                                    Logic.pet-drag-begin(
+                                        self.absolute-position.x + self.mouse-x,
+                                        self.absolute-position.y + self.mouse-y,
+                                    );
+                                } else {
+                                    Logic.pet-drag-end();
+                                }
                             }
+                            moved => { Logic.pet-drag-slide(); }
+                            clicked => { Logic.pet-badge-clicked(); }
                         }
-                        moved => { Logic.pet-drag-slide(); }
-                        double-clicked => { Logic.show-main-window(); }
-                        clicked => { Logic.toggle-pet-input(); }
                     }
                 }
             }

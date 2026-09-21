@@ -80,6 +80,68 @@ export struct PickerDay {
     rest: bool,            // 周末或法定假日,底色压暗一档
 }
 
+/// 渲染块的类型(见 src/markdown.rs)
+export enum MdKind {
+    /// 段落 / 列表 —— 行内样式交给 Slint 的 StyledText
+    rich,
+    heading,
+    code,
+    quote,
+    rule,
+    table,
+}
+
+/// 一个渲染块。
+///
+/// **两类字段别搞混**:`text` 是**已经解析过行内样式**的富文本(`styled-text` 类型,
+/// 由 Rust 侧 `StyledText::from_markdown` 产出),给 `StyledText` 元素用;
+/// `raw` 是**原样纯文本**,给 `Text` 元素用 —— 代码块和表格必须走这个,
+/// 否则代码里的 `*`、下划线会被当成强调标记吃掉。
+/// 表格里的一格
+export struct MdCell {
+    text: string,
+    row: int,
+    col: int,
+    /// 表头行:加底色和字重
+    header: bool,
+}
+
+export struct MdBlock {
+    kind: MdKind,
+    text: styled-text,
+    raw: string,
+    /// 标题级别 1..6
+    level: int,
+    /// 代码块的语言名(暂时只用来占位,以后可以加个语言标签)
+    lang: string,
+    /// 表格单元格,**已经在 Rust 侧拍平成带行列号的一维列表**。
+    ///
+    /// 为什么不给二维模型:Slint 不支持行内嵌套的 `for`
+    /// (`for row[i] in x : for cell in row : ...` 直接语法错),而 GridLayout 要的是
+    /// **扁平的直接子元素**才好对齐列。带着 row/column 就能用显式定位摆进去。
+    cells: [MdCell],
+}
+
+/// 一条对话消息的角色
+export enum ChatWho {
+    user,
+    assistant,
+    /// 系统提示(出错、被中断之类),居中显示、不画气泡
+    note,
+}
+
+/// 对话窗里的一条消息
+export struct ChatMsg {
+    who: ChatWho,
+    text: string,
+    /// 正在流式接收:尾巴上挂个光标
+    streaming: bool,
+    /// 助手消息切好的 Markdown 块(宿主解析,见 src/markdown.rs)。
+    /// 用户消息留空 —— 它们走纯文本气泡,不按 Markdown 解析
+    /// (用户随手打的 `*` 不该被吃掉)。
+    blocks: [MdBlock],
+}
+
 /// 一个桌宠动画(设置窗口里一行)。
 ///
 /// `name` 是素材里的名字(`idle-1` / `read` …),回调按它找回宿主那份配置 ——
@@ -402,6 +464,39 @@ export global AppData {
     in property <float> pet-size: 112;
     /// 所有动画,每个带自己的速度倍率(设置窗口里一行一个滑杆)
     in property <[PetAnim]> pet-anims;
+
+    // ── AI 对话窗口 ──
+    //
+    // 又是独立窗口,同样各持一份 AppData。宿主侧统一走 State::push_chat()。
+    in property <[ChatMsg]> chat-messages;
+    /// 输入框里的草稿(双向:用户打字要写回来)
+    in-out property <string> chat-draft;
+    /// 正在等回复 / 正在流式接收:输入框禁用,发送键变「停止」
+    in property <bool> chat-busy;
+    /// 状态行:忙时是「正在思考…」,闲时非空就是错误提示
+    in property <string> chat-status;
+    /// 接口设置面板开着没有
+    in-out property <bool> chat-config-open;
+    /// 接口配置(双向:设置面板里直接编辑)
+    in-out property <string> chat-base-url;
+    in-out property <string> chat-api-key;
+    in-out property <string> chat-model;
+    /// 宿主每追加/更新一条消息就 +1,UI 收到就把消息列表滚到底
+    in property <int> chat-scroll-tick;
+
+    // ── Markdown 草稿本窗口 ──
+    //
+    // 又是一个独立窗口,又是自己一份 AppData。宿主侧统一走 State::push_notes()。
+    /// 源码切好的块(见 src/markdown.rs)
+    in property <[MdBlock]> md-blocks;
+    /// 左边的源码(双向:用户在里面打字)
+    in-out property <string> md-source;
+    /// 有没有改动还没存
+    in property <bool> md-dirty;
+    /// 状态行:存到哪了 / 存盘失败之类
+    in property <string> md-status;
+    /// 每次重新切块就 +1(留给将来要做「滚回顶部」时用)
+    in property <int> md-tick;
     /// 未完成数,角标上显示;0 就不显示角标
     in property <int> pet-count: 0;
     /// 提醒气泡的文字,空 = 不显示
@@ -468,12 +563,25 @@ export global Logic {
     callback close-settings();
 
     // ── 桌宠 ──
-    /// 点一下宠物:展开 / 收起快速添加输入条
+    /// 点一下宠物。**宿主会延迟 250ms 再执行** —— 双击的第一下也是单击,
+    /// 立刻开输入条会把窗口撑高、打断 Slint 的双击判定(见 ui/pet.slint 里的说明)。
+    callback pet-clicked();
+    /// 双击宠物:弹出 AI 对话窗
+    callback pet-double-clicked();
+    /// 点宠物右上角那个**未完成数角标**(红点):打开主窗口的任务清单。
+    ///
+    /// 单独一条而不是复用 pet-clicked —— 那个是「延迟 250ms 的单击」,等的是双击,
+    /// 语义是「随手记一笔」;红点上的这一下不该有延迟,点开才是快。
+    callback pet-badge-clicked();
+    /// 点一下宠物:展开 / 收起快速添加输入条(也用于 Esc / 收起按钮)
     callback toggle-pet-input();
     /// 从桌宠直接加一条任务(不带日期)
     callback add-quick-task(string);
-    /// 双击宠物:把主窗口叫到前台
-    callback show-main-window();
+    /// 双击宠物:弹出 AI 对话窗(见 ui/chat.slint)。
+    ///
+    /// 原来这儿是「把主窗口叫到前台」—— 改成对话窗之后,主窗口仍然能从托盘菜单打开,
+    /// 而「双击宠物」这个动作留给最常用的那件事。
+    callback open-chat();
     /// 拖动桌宠:按下 / 拖动中 / 松开。
     ///
     /// 为什么不用内置的 `WindowMoveArea`:它靠 `input_event_filter_before_children`
@@ -494,6 +602,28 @@ export global Logic {
     callback set-pet-size(float);
     /// 设置里调**某个**桌宠动画的速度(按动画名找回那一条)
     callback set-pet-anim-speed(string, float);
+
+    // ── AI 对话 ──
+    /// 发一条消息(参数是输入框里的原文)
+    callback chat-send(string);
+    /// 中断当前这次生成
+    callback chat-cancel();
+    /// 关掉对话窗(只是藏起来,聊天记录留着)
+    callback chat-close();
+    /// 开关接口设置面板
+    callback chat-toggle-config();
+    /// 保存接口设置(base_url / api_key / model)
+    callback chat-save-config(string, string, string);
+
+    // ── Markdown 草稿本 ──
+    /// 存盘(关窗口时宿主也会自己存一次)
+    callback md-save();
+    /// 关掉草稿本
+    callback md-close();
+    /// 打开草稿本(现在由对话窗标题栏的按钮触发)
+    callback md-open();
+    /// 把一段 Markdown 追加到草稿本末尾(AI 回复旁边那个「存到笔记」)
+    callback md-append(string);
 
     // 无边框窗口的标题栏
     callback toggle-maximize();
