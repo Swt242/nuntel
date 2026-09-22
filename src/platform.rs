@@ -11,12 +11,17 @@ pub const WINDOW_TITLE: &str = "待办清单";
 
 /// 设置窗口标题。跟 `ui/settings.slint` 里 `SettingsWindow.title` 一致。
 ///
-/// **故意带上应用名**:`FindWindowW` 是按标题全局找的,单叫「设置」会撞上
-/// 别的程序里同名的窗口。窗口是无边框的,这个标题不会显示出来,取多长都无所谓。
+/// ⚠️ **这几个标题是拿来 `FindWindowW` 的,不是应用名。** 应用叫 Nuntel,
+/// 但窗口标题一律只写「自己是干什么的」—— 用户要的是窗口能找到、能区分,
+/// 而不是在每个窗口里重复一遍应用名。
+///
+/// 前缀「待办清单」留着有实际作用:像「设置」这种大众词单叫会撞上**别的程序**
+/// 里同名的窗口,全局按标题找就找错了。窗口是无边框的,这串标题不显示出来,
+/// 取多长都无所谓。
 pub const SETTINGS_TITLE: &str = "待办清单 · 设置";
 
 /// 桌宠窗口标题。跟 `ui/pet.slint` 里 `PetWindow.title` 一致。
-/// 同样带上应用名避免和别的程序撞名,而且它也不进任务栏,标题不会被看到。
+/// 同样带上前缀避免和别的程序撞名,而且它也不进任务栏,标题不会被看到。
 pub const PET_TITLE: &str = "待办清单 · 桌宠";
 /// AI 对话窗口的标题(用来 FindWindow 找窗口)
 pub const CHAT_TITLE: &str = "待办清单 · 助手";
@@ -25,7 +30,10 @@ pub const CHAT_TITLE: &str = "待办清单 · 助手";
 pub const NOTES_TITLE: &str = "待办清单 · 笔记";
 
 /// 开机自启在注册表里的值名
-const AUTOSTART_VALUE: &str = "rgui-todo";
+const AUTOSTART_VALUE: &str = "nuntel";
+
+/// 以前用过的自启项值名。启动时会把还在的老项搬过来(见 [`migrate_autostart`])。
+const OLD_AUTOSTART_VALUES: &[&str] = &["rgui-todo"];
 
 /// 日志文件超过这个大小就在启动时清空,免得无限长
 const LOG_MAX_BYTES: u64 = 256 * 1024;
@@ -34,14 +42,11 @@ const LOG_MAX_BYTES: u64 = 256 * 1024;
 ///
 /// 为什么不能只 `eprintln!`:release 构建带了 `windows_subsystem = "windows"`,
 /// 根本没有控制台,stderr 直接丢掉 —— 出问题时(通知没弹、自启写失败)什么都看不到。
-/// 所以除了打 stderr,还会追加到数据目录下的 rgui-todo.log。
+/// 所以除了打 stderr,还会追加到数据目录下的那个日志文件(见 `model::log_file`)。
 pub fn log(message: &str) {
     eprintln!("{message}");
 
-    let Some(path) = crate::model::data_file().parent().map(|dir| dir.join("rgui-todo.log"))
-    else {
-        return;
-    };
+    let path = crate::model::log_file();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -54,10 +59,7 @@ pub fn log(message: &str) {
 
 /// 启动时调一次:日志太大就清掉
 pub fn rotate_log_if_needed() {
-    let Some(path) = crate::model::data_file().parent().map(|dir| dir.join("rgui-todo.log"))
-    else {
-        return;
-    };
+    let path = crate::model::log_file();
     if std::fs::metadata(&path).map(|m| m.len() > LOG_MAX_BYTES).unwrap_or(false) {
         let _ = std::fs::remove_file(&path);
     }
@@ -75,7 +77,7 @@ pub fn acquire_single_instance() -> bool {
         use windows_sys::Win32::System::Threading::CreateMutexW;
 
         static HANDLE: OnceLock<usize> = OnceLock::new();
-        let name: Vec<u16> = "rgui-todo-single-instance\0".encode_utf16().collect();
+        let name: Vec<u16> = "nuntel-single-instance\0".encode_utf16().collect();
         // SAFETY: 传的是合法的以 0 结尾的宽字符串;句柄故意不关闭,活到进程结束。
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         // SAFETY: 紧跟 CreateMutexW 之后调用,读的是同一次系统调用的结果。
@@ -527,6 +529,46 @@ pub fn autostart_enabled() -> bool {
     }
 }
 
+/// 把老值名下的开机自启搬到新值名下。改名专用,启动时调一次。
+///
+/// **不能只是把老值删掉**:老值里存的是**老的 exe 路径**(`rgui-todo.exe`),
+/// 那个文件改名后就不存在了,这条自启其实早就废了。所以是「读老值 → 按现在这个
+/// exe 的路径写新值 → 删老值」,等于顺手替用户把自启重新指对地方。
+///
+/// 老值不存在(大多数人没开过自启)就什么都不做 —— 这是最常见的路径。
+pub fn migrate_autostart() {
+    #[cfg(windows)]
+    {
+        use winreg::RegKey;
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
+
+        let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_SET_VALUE)
+        else {
+            return;
+        };
+        for old in OLD_AUTOSTART_VALUES {
+            if key.get_value::<String, _>(old).is_err() {
+                continue; // 没这一项,正常
+            }
+            // 新的已经有了就以新的为准,只把老的那条清掉
+            if key.get_value::<String, _>(AUTOSTART_VALUE).is_err()
+                && let Ok(exe) = std::env::current_exe()
+            {
+                let command = format!("\"{}\"", exe.display());
+                if let Err(err) = key.set_value(AUTOSTART_VALUE, &command) {
+                    log(&format!("搬自启项失败,开机自启这次没接上: {err}"));
+                    continue; // 新的没写成功就先留着老的,下次再试
+                }
+            }
+            match key.delete_value(old) {
+                Ok(()) => log(&format!("自启项已从 {old} 搬到 {AUTOSTART_VALUE}")),
+                Err(err) => log(&format!("删掉老自启项 {old} 失败: {err}")),
+            }
+        }
+    }
+}
+
 /// 开关开机自启。写的是 HKCU,不需要管理员权限。
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
     #[cfg(windows)]
@@ -610,7 +652,9 @@ impl Tray {
             .map_err(|e| format!("建托盘图标失败: {e}"))?;
 
         let tray = TrayIconBuilder::new()
-            .with_tooltip("待办清单")
+            // 托盘悬停提示 —— 应用名唯一露脸的地方之一(另一个是 exe 文件名)。
+            // 各个窗口的标题不叫这个,它们只写自己是干什么的。
+            .with_tooltip("Nuntel")
             .with_icon(icon)
             .with_menu(Box::new(menu))
             .build()

@@ -4,7 +4,7 @@
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/shot.ps1 -Out e:\work\rgui\tmp\shot.png
 param(
-  [string]$Process = "rgui-todo",
+  [string]$Process = "nuntel",
   [string]$Out = "$env:TEMP\rgui-shot.png",
   [int]$ParkX = 1600,
   [int]$ParkY = 60

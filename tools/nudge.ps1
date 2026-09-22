@@ -4,7 +4,7 @@
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/nudge.ps1 -Prefix e:\work\rgui\tmp
 param(
-  [string]$Process = "rgui-todo",
+  [string]$Process = "nuntel",
   [string]$Prefix = "$env:TEMP\rgui",
   [int]$ParkX = 1600,
   [int]$ParkY = 60

@@ -30,7 +30,7 @@ function Find-AppWindow([int]$width) {
         $q = [uint32]0
         [OCP]::GetWindowThreadProcessId($h, [ref]$q) | Out-Null
         $name = (Get-Process -Id $q -ErrorAction SilentlyContinue).ProcessName
-        if ($name -eq "rgui-todo" -and [OCP]::IsWindowVisible($h)) {
+        if ($name -eq "nuntel" -and [OCP]::IsWindowVisible($h)) {
             $r = New-Object OCP+RECT
             [OCP]::GetWindowRect($h, [ref]$r) | Out-Null
             if (($r.R - $r.L) -eq $script:w) { $script:hit = $h; $script:rect = $r; return $false }

@@ -9,7 +9,8 @@
 // 否则切外观时这里不会跟着变。
 
 import {
-    AppData, Appearance, Backdrop, PanelEdge, Logic, Slider, Theme, VCenter, WindowButton,
+    AppData, Appearance, Backdrop, Chip, PanelEdge, Logic, Slider, Theme, ThemePreference,
+    Toggle, VCenter, WindowButton,
 } from "widgets.slint";
 
 /// 外观预览小图。
@@ -206,9 +207,10 @@ export component SettingsWindow inherits Window {
     // 固定尺寸:设置面板不需要缩放。写 `width`/`height` 就是固定(见 Slint 文档)。
     // 宽度按三张外观卡排得下来定的:(520 - 2×16 内边距 - 2×12 间距) / 3 ≈ 154。
     width: 520px;
-    // 高度按内容量出来的:外观三张卡 + 桌宠大小 + 10 个动画各一行滑杆。
-    // 加动画(往 assets/pet 里丢素材)就要跟着加高 —— 布局不会自己撑开窗口。
-    height: 700px;
+    // 高度按内容量出来的:外观三张卡 + 亮暗一行 + 启动一行 + 桌宠大小
+    // + 10 个动画各一行滑杆。
+    // 加动画(往 assets/pet 里丢素材)或加一节都要跟着加高 —— 布局不会自己撑开窗口。
+    height: 842px;
     background: Theme.bg;
     no-frame: true;
     icon: @image-url("icons/app.svg");
@@ -269,6 +271,66 @@ export component SettingsWindow inherits Window {
 
             Text {
                 text: "选中立刻生效,并记到下次启动";
+                font-size: 11px;
+                color: Theme.text-dim;
+            }
+
+            // ── 亮暗 ──
+            // 和「外观主题」挨着放:两个都是外观维度,一共 3×2 种组合。
+            // (原先主窗口标题行有个太阳/月亮按钮能切,已经挪过来了 ——
+            //  同一件事有两个入口,用户不一定找得到另一个。)
+            //
+            // 判据用 `Theme.dark`(算过的结果)而不是 `Theme.preference`:
+            // 老数据里 preference 可能是 system,那样两个 Chip 会都不亮;
+            // Theme.dark 在跟随系统时也已经解析成了实际的亮/暗。
+            Text {
+                text: "亮暗";
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.text;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+
+                Chip {
+                    label: "亮色";
+                    selected: !Theme.dark;
+                    clicked => { Logic.set-theme-preference(ThemePreference.light); }
+                }
+
+                Chip {
+                    label: "暗色";
+                    selected: Theme.dark;
+                    clicked => { Logic.set-theme-preference(ThemePreference.dark); }
+                }
+            }
+
+            // ── 启动 ──
+            // 开机自启原来是主窗口底栏上那个开关,挪过来了 ——
+            // 和「外观 / 亮暗」一个道理:都是设置,就该在设置里找得到。
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+
+            Text {
+                text: "启动";
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.text;
+            }
+
+            autostart-toggle := Toggle {
+                label: "开机自启";
+                checked: AppData.autostart;
+                // 开关状态**以宿主为准**:写注册表可能失败(企业策略、权限),
+                // 失败时宿主会把开关拨回来,不能停在骗人的状态上。
+                toggled => { Logic.set-autostart(self.checked); }
+            }
+
+            Text {
+                text: "开机时自动运行(写 HKCU,不需要管理员)";
                 font-size: 11px;
                 color: Theme.text-dim;
             }

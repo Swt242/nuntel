@@ -340,18 +340,16 @@ export component AppWindow inherits Window {
                 vertical-alignment: center;
                 horizontal-stretch: 1;
             }
+            // 只报「还剩几件」。原先全做完时会显示「全部完成」,但那一行是**纯文字**、
+            // 点不动,看着像个按钮却什么也不做 —— 去掉了,一律归到「暂无任务」。
+            // (右下角那个「全部完成 / 全部取消」是真的按钮,那个留着。)
             Text {
-                text: (AppData.remaining + AppData.completed) == 0 ? "暂无任务"
-                    : (AppData.remaining > 0 ? "\{AppData.remaining} 项待办" : "全部完成");
+                text: AppData.remaining > 0 ? "\{AppData.remaining} 项待办" : "暂无任务";
                 font-size: 13px;
                 color: AppData.remaining > 0 ? Theme.text-dim : Theme.accent-ink;
                 vertical-alignment: center;
             }
-            theme-toggle := IconButton {
-                icon: Theme.dark ? @image-url("icons/moon.svg") : @image-url("icons/sun.svg");
-                icon-size: 17px;
-                clicked => { Logic.cycle-theme(); }
-            }
+            // 亮暗切换搬到设置窗口里去了(和「外观主题」并排,两个维度挨着才找得到)
         }
 
         // 提醒横幅:有没确认的提醒时顶上来
@@ -598,17 +596,10 @@ export component AppWindow inherits Window {
         }
 
         // 底栏
+        // (「开机自启」原来在这儿,已经和「外观 / 亮暗」一起收进设置窗口了 ——
+        //  同一类东西散在两处,用户不一定找得到另一半。)
         HorizontalLayout {
             spacing: 8px;
-
-            VCenter {
-                autostart-toggle := Toggle {
-                    label: "开机自启";
-                    checked: AppData.autostart;
-                    // 开关状态以宿主为准(写注册表可能失败)
-                    toggled => { Logic.set-autostart(self.checked); }
-                }
-            }
 
             Rectangle { horizontal-stretch: 1; }
 

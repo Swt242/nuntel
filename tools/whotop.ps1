@@ -2,11 +2,11 @@
 # screen capture would show there, and which window is on top at that point.
 # Points come from the real window rect, so no argument parsing games.
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/whotop.ps1 -Process rgui-todo
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/whotop.ps1 -Process nuntel
 #
-# If a point reports top=rgui-todo but a colour that is NOT one of the app's dark
+# If a point reports top=nuntel but a colour that is NOT one of the app's dark
 # colours, the app is leaving that part of its own window unpainted/transparent.
-param([string]$Process = "rgui-todo")
+param([string]$Process = "nuntel")
 
 Add-Type -AssemblyName System.Drawing
 Add-Type @"

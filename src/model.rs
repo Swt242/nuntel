@@ -321,14 +321,90 @@ pub fn save_ai(path: &Path, cfg: &AiConfig) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("改名到 {} 失败: {e}", path.display()))
 }
 
-/// 数据文件路径:`%APPDATA%\rgui-todo\todos.json`(非 Windows 上退回 XDG/HOME)
-pub fn data_file() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
+/// 应用在用户数据目录下的文件夹名。
+///
+/// **改名时这个要跟着改**,并且把老名字登记到 `OLD_APP_DIRS` 里 ——
+/// 不然老用户的任务和笔记会「凭空消失」(东西其实还在老文件夹里躺着)。
+const APP_DIR: &str = "nuntel";
+
+/// 以前用过的文件夹名。启动时会把第一个还在的整个搬过来。
+const OLD_APP_DIRS: &[&str] = &["rgui-todo"];
+
+/// 用户数据目录的父级(`%APPDATA%`;非 Windows 上退回 XDG/HOME)
+fn data_root() -> PathBuf {
+    std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("rgui-todo").join("todos.json")
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 数据目录:`%APPDATA%\nuntel\`。
+///
+/// **这里定义了这个目录里都有什么**(todos / 笔记库 / AI 配置 / 日志),
+/// 别的地方要路径就调这几个函数,不要自己拼。
+pub fn data_dir() -> PathBuf {
+    data_root().join(APP_DIR)
+}
+
+/// 待办数据文件
+pub fn data_file() -> PathBuf {
+    data_dir().join("todos.json")
+}
+
+/// 运行日志。放在这里而不是 platform.rs:日志就是数据目录里的一个文件,
+/// 目录布局只该有一处定义(`migrate_old_data_dirs` 也要按同一个名字找它)。
+pub fn log_file() -> PathBuf {
+    data_dir().join(format!("{APP_DIR}.log"))
+}
+
+/// 把老版本的数据目录整个搬成新的。**改名专用,和业务无关。**
+///
+/// ⚠️ **必须在任何读写之前调用**(`main()` 的第一件事)。日志、待办、笔记、
+/// AI 配置全在这个目录下,晚一步就会先在新目录里建出文件来,那时 `new.exists()`
+/// 为真、搬迁直接放弃 —— 用户看到的就是「我的任务和笔记全没了」。
+///
+/// 用 `rename` 而不是逐个文件复制:同一个父目录下它是原子的,而且**搬完老目录就没了,
+/// 天然只生效一次**,不需要额外的「搬过了」标记(笔记库那个老单文件迁移也是这个路子)。
+pub fn migrate_old_data_dirs() {
+    let new = data_dir();
+    for old_name in OLD_APP_DIRS {
+        let old = data_root().join(old_name);
+        if !old.is_dir() {
+            continue;
+        }
+        if new.exists() {
+            // 两边都在就**不动**:里面可能都有东西,自动合并只会把数据搞乱。
+            // 说清楚让用户自己搬,比猜他要保留哪份强。
+            crate::platform::log(&format!(
+                "{} 和 {} 都存在,不自动搬迁 —— 需要保留旧数据的话请手工挪过来",
+                old.display(),
+                new.display()
+            ));
+            continue;
+        }
+        match std::fs::rename(&old, &new) {
+            Ok(()) => {
+                rename_log_inside(&new, old_name);
+                crate::platform::log(&format!(
+                    "数据目录已从 {} 搬到 {}",
+                    old.display(),
+                    new.display()
+                ));
+            }
+            // 搬不动就按新目录跑,顶多是「看起来像新装」,总比起不来强
+            Err(err) => crate::platform::log(&format!("搬数据目录失败,这次按新目录跑: {err}")),
+        }
+    }
+}
+
+/// 日志文件跟着改个名,免得新目录里躺着一个名字对不上的旧日志。
+/// 失败无所谓 —— 日志本来就是排查用的,不影响任何功能。
+fn rename_log_inside(new_dir: &Path, old_name: &str) {
+    let old_log = new_dir.join(format!("{old_name}.log"));
+    if old_log.is_file() {
+        let _ = std::fs::rename(&old_log, new_dir.join(format!("{APP_DIR}.log")));
+    }
 }
 
 /// 读盘。文件不存在或内容坏了都当空清单处理,不让应用起不来。

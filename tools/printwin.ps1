@@ -3,9 +3,9 @@
 # Also reports the colour of a few probe points and of any fully transparent pixel
 # (transparent shows up as alpha 0 / black in the DIB).
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/printwin.ps1 -Process rgui-todo
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/printwin.ps1 -Process nuntel
 param(
-  [string]$Process = "rgui-todo",
+  [string]$Process = "nuntel",
   [string]$Out = "E:\work\rgui\tmp\printwin.png",
   # 只挑这个尺寸的窗口(0 = 不限)。用来截主窗口之外的窗口,比如设置窗口 520x344。
   [int]$MatchWidth = 0,

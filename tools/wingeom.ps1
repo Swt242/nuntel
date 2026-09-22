@@ -3,8 +3,8 @@
 # compositor actually treats as the visible frame -- differs from GetWindowRect when
 # the window has an invisible resize border).
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/wingeom.ps1 -Process rgui-todo
-param([string]$Process = "rgui-todo")
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/wingeom.ps1 -Process nuntel
+param([string]$Process = "nuntel")
 
 Add-Type @"
 using System;

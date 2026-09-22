@@ -25,7 +25,7 @@ MINGW_LIBS="$HOME/.slint-tools/mingw-libs"
 # 1) rust-mingw 自带的导入库不全(缺 libshlwapi.a 等,链接最后一步会报
 #    "cannot find -lshlwapi")。从 MSYS2 的 crt 包里补齐,只补自包含库里
 #    没有的,不覆盖原文件。rustup 重装工具链后这里会自动补回来。
-STAMP="$SELF_CONTAINED/.rgui-todo-mingw-libs"
+STAMP="$SELF_CONTAINED/.nuntel-mingw-libs"
 if [ -d "$MINGW_LIBS" ] && [ -d "$SELF_CONTAINED" ] && [ ! -e "$STAMP" ]; then
     for lib in "$MINGW_LIBS"/lib*.a; do
         name=$(basename "$lib")
@@ -40,7 +40,7 @@ fi
 #    注意:rustup 自带的 dlltool 是去**自己所在目录**找 as 的(实测放 PATH 上
 #    不管用,报 "dlltool.exe: CreateProcess"),所以要把 binutils 复制到它旁边。
 #    只复制它没有的,不覆盖 rustup 自己的 ld.exe / gcc。
-BINUTILS_STAMP="$DLLTOOL_DIR/.rgui-todo-binutils"
+BINUTILS_STAMP="$DLLTOOL_DIR/.nuntel-binutils"
 if [ -d "$BINUTILS_DIR" ] && [ -d "$DLLTOOL_DIR" ] && [ ! -e "$BINUTILS_STAMP" ]; then
     for tool in "$BINUTILS_DIR"/*.exe; do
         name=$(basename "$tool")

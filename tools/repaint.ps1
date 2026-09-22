@@ -4,7 +4,7 @@
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/repaint.ps1
 param(
-  [string]$Process = "rgui-todo",
+  [string]$Process = "nuntel",
   [int]$X = 1600,
   [int]$Y = 60,
   [string]$Prefix = "E:\work\rgui\tmp\rp"

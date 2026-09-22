@@ -15,6 +15,9 @@ import { Palette } from "std-widgets.slint";
 export enum Filter { all, active, completed }
 export enum ThemePreference { system, light, dark }
 export enum View { list, calendar, week }
+/// 笔记窗口的显示方式。三档,窗口本身大小不变 ——
+/// 「只编辑」「只预览」是让那一栏铺满内容区,不是把窗口弄全屏。
+export enum MdView { split, edit, preview }
 
 /// 界面外观。跟亮暗是两个独立的维度,一共 3×2 种组合。
 ///
@@ -120,6 +123,15 @@ export struct MdBlock {
     /// (`for row[i] in x : for cell in row : ...` 直接语法错),而 GridLayout 要的是
     /// **扁平的直接子元素**才好对齐列。带着 row/column 就能用显式定位摆进去。
     cells: [MdCell],
+}
+
+/// 笔记库里的一个文件(`%APPDATA%\nuntel\notes\*.md`)。
+///
+/// **只带名字不带路径**:库就一个目录、不递归,文件名(去掉 `.md`)既是显示名也是 id。
+/// 选中项由视图拿 `AppData.md-current` 比出来(和 `TodoRow` 的 `editing` 同一套写法),
+/// 不放进结构里 —— 否则每次换选中都要重建整个模型。
+export struct NoteItem {
+    name: string,
 }
 
 /// 一条对话消息的角色
@@ -487,6 +499,15 @@ export global AppData {
     // ── Markdown 草稿本窗口 ──
     //
     // 又是一个独立窗口,又是自己一份 AppData。宿主侧统一走 State::push_notes()。
+    /// 笔记库里的文件列表(库目录下这一层的 `*.md`,不递归)
+    in property <[NoteItem]> md-notes;
+    /// 当前打开的是哪一篇(文件名的去扩展名形式);空 = 一篇都没选
+    in property <string> md-current;
+    /// 分屏 / 只编辑 / 只预览
+    in property <MdView> md-view: split;
+    /// 左边那列文件列表收没收起来。单栏模式下默认收起(要的就是「铺满」),
+    /// 但标题栏留了个开关能随时叫回来 —— 不然只编辑时没法切笔记
+    in property <bool> md-list-shown: true;
     /// 源码切好的块(见 src/markdown.rs)
     in property <[MdBlock]> md-blocks;
     /// 左边的源码(双向:用户在里面打字)
@@ -504,6 +525,20 @@ export global AppData {
     /// 是不是展开了「快速添加」输入条
     in property <bool> pet-adding: false;
     in-out property <string> pet-draft;
+
+    // ── 桌宠那一圈功能图标(悬停弹出)──
+    //
+    // 几何全由宿主算:窗口大小就是按这几个数定的,不能两边各算一份。
+    /// 这一圈开着没有
+    in property <bool> pet-ring-open: false;
+    /// 环要占的高度(0 = 没开)。宠物那一格的高度是 `pet-size + 这个`
+    in property <float> pet-ring-band: 0;
+    /// 图标中心离宠物中心的距离
+    in property <float> pet-ring-radius: 0;
+    /// 圆形按钮的直径
+    in property <float> pet-ring-icon: 44;
+    /// 从正上方往两边各偏多少度
+    in property <float> pet-ring-spread: 45;
 }
 
 // ── UI 回调宿主的动作 ─────────────────────────────────────────────────
@@ -519,7 +554,6 @@ export global Logic {
     callback begin-edit(int);
     callback commit-edit(string);
     callback cancel-edit();
-    callback cycle-theme();
     // 视图 / 日历
     callback set-view(View);
     callback shift-month(int);
@@ -557,6 +591,10 @@ export global Logic {
     // 设置
     callback set-autostart(bool);
     callback set-appearance(Appearance);
+    /// 亮色 / 暗色。原先标题栏有个太阳/月亮按钮来回切,现在和「外观主题」并排放在
+    /// 设置窗口里 —— 两个都是外观维度,分居两处找不全。
+    /// 只有两档(**不加回「跟随系统」**):那个按钮当初就是故意做成两档来回切的。
+    callback set-theme-preference(ThemePreference);
     /// 打开设置窗口(已经在开着就把它叫到前面)
     callback open-settings();
     /// 关掉设置窗口(只是隐藏,窗口留着下次直接显示)
@@ -573,6 +611,13 @@ export global Logic {
     /// 单独一条而不是复用 pet-clicked —— 那个是「延迟 250ms 的单击」,等的是双击,
     /// 语义是「随手记一笔」;红点上的这一下不该有延迟,点开才是快。
     callback pet-badge-clicked();
+    /// 点了悬停弹出来的那一圈里的某个图标。
+    ///
+    /// 参数是动作名,目前 `"notes"` / `"list"` / `"settings"`,宿主分发到对应的
+    /// 打开函数(见 State::pet_ring_action)。**用字符串而不是三个 callback**:
+    /// 图标是写死在 ui/pet.slint 里的三个 `RingButton`,加图标时宿主只多一个
+    /// match 分支,不用再动 widgets.slint 的接口。
+    callback pet-ring-action(string);
     /// 点一下宠物:展开 / 收起快速添加输入条(也用于 Esc / 收起按钮)
     callback toggle-pet-input();
     /// 从桌宠直接加一条任务(不带日期)
@@ -624,6 +669,18 @@ export global Logic {
     callback md-open();
     /// 把一段 Markdown 追加到草稿本末尾(AI 回复旁边那个「存到笔记」)
     callback md-append(string);
+    /// 换一篇笔记(参数是名字,不是下标 —— 列表随时会重建)
+    callback md-select(string);
+    /// 新建一篇
+    callback md-new();
+    /// 改名。宿主负责净化名字、挡撞名,失败了把话说在状态栏上
+    callback md-rename(string, string);
+    /// 删掉一篇(**直接删文件,不进回收站**,所以界面上要点两次)
+    callback md-delete(string);
+    /// 切 分屏 / 只编辑 / 只预览
+    callback md-set-view(MdView);
+    /// 收起 / 展开左边那列文件列表
+    callback md-toggle-list();
 
     // 无边框窗口的标题栏
     callback toggle-maximize();
@@ -704,6 +761,122 @@ export component IconButton inherits Rectangle {
     touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { if (root.enabled) { root.clicked(); } }
+    }
+}
+
+/// 桌宠那一圈里的圆形功能按钮:圆底 + 图标 + 圆下面一句小标签。
+///
+/// 为什么不直接拿 `IconButton` 放大:它压在**桌面和其它窗口**上,底色不能透明
+/// —— 透明按钮在别人的窗口上根本看不清。所以这里底色用 `Theme.sheet`
+/// (几乎不透明的浮层色),和提醒气泡、快速添加输入条是同一个理由(见 ui/pet.slint)。
+export component RingButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    /// 右上角的小角标(未完成数)。空 = 不显示
+    in property <string> badge: "";
+    in property <length> size: 44px;
+    in property <length> icon-size: 20px;
+    /// 露不露出来(桌宠悬停时整圈一起亮)。隐藏时不进输入树,不会误吃点击
+    in property <bool> shown: true;
+
+    callback clicked();
+
+    // 宽度就按圆的直径:标签胶囊比它窄(两个字 22px + 内边距),
+    // 万一以后标签更长,溢出去也就溢出去,不做裁剪(裁了更难看)
+    width: self.size;
+    height: self.size + 5px + 17px;
+    background: transparent;
+    visible: self.shown;
+    opacity: self.shown ? 1 : 0;
+
+    animate opacity { duration: 140ms; }
+
+    circle := Rectangle {
+        width: root.size;
+        height: root.size;
+        x: 0;
+        y: 0;
+        // 正圆:圆角 = 边长的一半(项目里另一处这么写的是 Slider 的滑块)。
+        // `* Theme.radius-scale` 照规矩带上 —— 工业风那块把圆角拉到 0 会变成方块,
+        // 但那是那套外观本来的风格
+        border-radius: (self.width / 2) * Theme.radius-scale;
+        background: touch.has-hover ? Theme.hover : Theme.sheet;
+        border-width: 1px;
+        border-color: touch.has-hover ? Theme.accent-ink : Theme.border;
+        // 非 glass 外观下 Theme.shadow 本身就是透明的,投影会自动失效
+        drop-shadow-color: Theme.shadow;
+        drop-shadow-blur: 12px;
+        drop-shadow-offset-y: 3px;
+
+        animate background { duration: 120ms; }
+        animate border-color { duration: 120ms; }
+
+        Image {
+            source: root.icon;
+            width: root.icon-size;
+            height: root.icon-size;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            colorize: touch.has-hover ? Theme.accent-ink : Theme.text-dim;
+
+            animate colorize { duration: 120ms; }
+        }
+
+        // 未完成数角标。做法和宠物身上那个一样:白色细环 + danger 底
+        // (窗口是透明的,拿主题底色描边会凭空出现一圈方块)
+        if root.badge != "" : Rectangle {
+            width: badge-text.width + 10px;
+            height: 18px;
+            border-radius: 9px * Theme.radius-scale;
+            background: Theme.danger;
+            border-width: 2px;
+            border-color: #ffffffd9;
+            x: parent.width - self.width + 7px;
+            y: -4px;
+
+            badge-text := Text {
+                text: root.badge;
+                font-size: 11px;
+                font-weight: 700;
+                color: #ffffff;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                x: 5px;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+    }
+
+    // 标签胶囊:压在桌面上,所以也给它一层不透明的底
+    label-pill := Rectangle {
+        width: label-text.width + 14px;
+        height: 17px;
+        x: (parent.width - self.width) / 2;
+        y: root.size + 5px;
+        border-radius: 9px * Theme.radius-scale;
+        background: Theme.sheet;
+        border-width: 1px;
+        border-color: touch.has-hover ? Theme.accent-ink : Theme.border;
+
+        animate border-color { duration: 120ms; }
+
+        label-text := Text {
+            text: root.label;
+            font-size: 11px;
+            color: touch.has-hover ? Theme.accent-ink : Theme.text-dim;
+            vertical-alignment: center;
+            x: 7px;
+            y: (parent.height - self.height) / 2;
+
+            animate color { duration: 120ms; }
+        }
+    }
+
+    // **盖住整个控件(圆 + 标签)**,不是只盖圆:标签点不动会很怪。
+    // 不在布局里,TouchArea 默认就撑满父元素
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
     }
 }
 

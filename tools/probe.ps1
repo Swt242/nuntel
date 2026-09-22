@@ -1,10 +1,10 @@
 # Sample actual screen pixels around the app's windows to find out which parts of a
 # window are opaque and which let the desktop through.
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/probe.ps1 -Process rgui-todo
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/probe.ps1 -Process nuntel
 #
 # Prints "#rrggbb" hex per sample point. ASCII-only source (see winlist.ps1).
-param([string]$Process = "rgui-todo")
+param([string]$Process = "nuntel")
 
 Add-Type -AssemblyName System.Drawing
 Add-Type @"

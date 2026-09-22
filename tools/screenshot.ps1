@@ -41,9 +41,9 @@ public class Win {
 }
 "@
 
-$appPid = (Get-Process -Name "rgui-todo" -ErrorAction SilentlyContinue | Select-Object -First 1).Id
+$appPid = (Get-Process -Name "nuntel" -ErrorAction SilentlyContinue | Select-Object -First 1).Id
 if (-not $appPid) {
-    Write-Error "no 'rgui-todo' process - start the app first"
+    Write-Error "no 'nuntel' process - start the app first"
     exit 1
 }
 

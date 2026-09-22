@@ -2,8 +2,8 @@
 # Source is pure ASCII on purpose: Windows PowerShell reads BOM-less .ps1 as ANSI,
 # so any non-ASCII literal here would be mangled. Titles are read at runtime.
 #
-#   powershell -ExecutionPolicy Bypass -File tools/winlist.ps1 -Process rgui-todo
-param([string]$Process = "rgui-todo")
+#   powershell -ExecutionPolicy Bypass -File tools/winlist.ps1 -Process nuntel
+param([string]$Process = "nuntel")
 
 Add-Type @"
 using System;

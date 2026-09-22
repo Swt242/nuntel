@@ -1,4 +1,4 @@
-// Markdown 草稿本 —— 左边源码、右边实时预览。
+// Markdown 笔记 —— 左边文件列表、中间源码、右边实时预览。
 //
 // 分工(见 src/markdown.rs 的顶部说明):
 // - 宿主把源码**切块**(标题/代码块/引用/分隔线/表格 Slint 的 StyledText 不认),
@@ -6,28 +6,147 @@
 // - `raw` 那几块(代码、表格)走**等宽纯文本**,绝不过 StyledText ——
 //   否则代码里的 `*` 和下划线会被当成强调标记吃掉。
 //
+// **多笔记**:库是 `%APPDATA%\nuntel\notes\` 这一层下的 `*.md`(见 src/notes.rs),
+// 左边那列就是它。文件名(去扩展名)既是显示名也是 id。
+//
 // ⚠️ 独立窗口,又是自己一份 AppData / Logic,宿主得单独推、单独接。
 
 import { ScrollView } from "std-widgets.slint";
 import { MdBlockView } from "markdown.slint";
 import {
-    AppData, Backdrop, Logic, MdKind, PanelEdge, Theme, TextButton,
-    VCenter, WindowButton,
+    AppData, Backdrop, FilterTab, IconButton, Logic, MdKind, MdView, PanelEdge, Theme,
+    TextButton, VCenter, WindowButton,
 } from "widgets.slint";
+
+/// 笔记列表里的一行。
+///
+/// 就地改名和任务行(`ui/app.slint` 的 `TodoRow`)是同一套:双击进编辑、回车提交、
+/// Esc 取消。改名状态放在**本组件自己的属性**里,不走 AppData —— 一次只有一行在改名,
+/// 而列表只在增删改的时候重建(打字期间不会),本地状态活得下来。
+component NoteRow inherits Rectangle {
+    in property <string> name;
+    in property <bool> selected: false;
+
+    callback clicked();
+    callback committed(string);
+    callback remove-requested();
+
+    /// 正在就地改名
+    property <bool> renaming: false;
+    /// 改名用的草稿
+    property <string> draft: "";
+    /// 删除要点两次 —— 这是**直接删文件、不进回收站**,给一次反悔的机会
+    property <bool> confirm: false;
+
+    height: 30px;
+    border-radius: 7px * Theme.radius-scale;
+    background: selected ? Theme.card
+        : (hover.has-hover ? Theme.hover : transparent);
+
+    animate background { duration: 120ms; }
+
+    // 铺满整行、垫在最底下:双击改名、单击切换。放在后面的话会盖住删除按钮
+    hover := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+        double-clicked => {
+            root.draft = root.name;
+            root.confirm = false;
+            root.renaming = true;
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 2px;
+        spacing: 4px;
+
+        if root.renaming : TextInput {
+            text <=> root.draft;
+            color: Theme.text;
+            font-size: 12px;
+            single-line: true;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            init => { self.focus(); }
+            accepted => { root.renaming = false; root.committed(root.draft); }
+            // 只接管 Esc;其余按键必须 reject,否则 TextInput 内置的编辑逻辑
+            // 不会执行(字打不进去)
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) {
+                    root.renaming = false;
+                    accept
+                } else {
+                    reject
+                }
+            }
+        }
+
+        if !root.renaming : Text {
+            text: root.name;
+            font-size: 12px;
+            // 选中的那行用强调色描边感不够,直接加粗 + 换色
+            color: root.selected ? Theme.accent-ink : Theme.text;
+            font-weight: root.selected ? 700 : 400;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+            wrap: no-wrap;
+        }
+
+        // 删除:平时藏着(鼠标移上来才露),点了变「确认?」再点一次才真删。
+        // 藏起来的时候 `visible: false` 让它整块不吃鼠标事件,所以不影响单击换笔记。
+        VCenter {
+            visible: !root.renaming && (hover.has-hover || root.confirm);
+            TextButton {
+                label: root.confirm ? "确认?" : "删除";
+                clicked => {
+                    if (root.confirm) {
+                        root.confirm = false;
+                        root.remove-requested();
+                    } else {
+                        root.confirm = true;
+                    }
+                }
+            }
+        }
+    }
+}
 
 export component NotesWindow inherits Window {
     title: "待办清单 · 笔记";
     // 用 preferred-* 而不是 width/height:写 width 就是**固定尺寸**(窗口拉不动),
     // 而且 Slint 不允许同时写 height 和 min-height。笔记窗要能拉大才好写长文。
-    preferred-width: 820px;
+    preferred-width: 900px;
     preferred-height: 560px;
-    min-width: 520px;
+    // 最小宽度按标题栏塞得下算:名字 + 三档切换 + 列表开关 + 保存 + 关闭
+    min-width: 560px;
     min-height: 320px;
     background: Theme.bg;
     no-frame: true;
     resize-border-width: 6px;
     icon: @image-url("icons/app.svg");
     default-font-size: 14px;
+
+    // ── 三个面板的宽度 ──
+    //
+    // 面板还是**绝对定位的兄弟**,不用布局:里面的 ScrollView 对宽度很敏感
+    // (见下面 `md-scroll` 那段注释),塞进布局里那两条约束就不好写了。
+    // 位置由一个模式(分屏/只编辑/只预览)和一个开关(列表收不收)一起决定。
+    //
+    // 「只编辑 / 只预览」= 让那一栏**铺满内容区**,不是把窗口弄全屏 ——
+    // 窗口本身大小不变,用户自己拉。
+    // (这几个属性声明在窗口根上,下面各个面板要用 `parent.xxx` 引 ——
+    //  面板里写 `self.xxx` 指的是面板自己,那是另一个东西。)
+    private property <length> bar-h: 36px;
+    private property <length> foot-h: 22px;
+    private property <length> body-h: self.height - self.bar-h - self.foot-h;
+    private property <length> list-w: AppData.md-list-shown ? 168px : 0px;
+    private property <length> area-w: self.width - self.list-w;
+    private property <length> src-w:
+        AppData.md-view == MdView.split ? self.area-w / 2
+        : (AppData.md-view == MdView.edit ? self.area-w : 0px);
+    private property <length> prev-w: self.area-w - self.src-w;
 
     Backdrop {
         x: 0;
@@ -41,7 +160,7 @@ export component NotesWindow inherits Window {
         x: 0;
         y: 0;
         width: parent.width;
-        height: 36px;
+        height: root.bar-h;
         background: Theme.card;
         border-width: 1px;
         border-color: Theme.border;
@@ -54,20 +173,70 @@ export component NotesWindow inherits Window {
                 padding-right: 4px;
                 spacing: 8px;
 
+                // 当前是哪一篇。列表收起来的时候(只编辑/只预览)就靠它认路,
+                // 所以哪怕列表开着也一直显示。
+                //
+                // **不再另外写一个「笔记」标题** —— 窗口标题和图标已经说明了这是什么,
+                // 两个词并排写着(「笔记 笔记」)只会让人以为看错了。一篇都没选的时候
+                // 退回「笔记」,免得这一格空着。
                 Text {
-                    text: "笔记";
+                    text: AppData.md-current == "" ? "笔记" : AppData.md-current;
                     font-size: 12px;
                     color: Theme.text;
                     vertical-alignment: center;
-                }
-                Text {
-                    // 存哪了写出来,免得用户找不到文件
-                    text: AppData.md-status;
-                    font-size: 11px;
-                    color: AppData.md-dirty ? Theme.accent-ink : Theme.text-dim;
-                    vertical-alignment: center;
                     horizontal-stretch: 1;
                     overflow: elide;
+                    wrap: no-wrap;
+                }
+
+                VCenter {
+                    // 分屏 / 只编辑 / 只预览。和主窗口的「清单/日历/周」同一个控件、
+                    // 同一套视觉 —— 语义都是「换一种看法」。
+                    Rectangle {
+                        height: 26px;
+                        border-radius: 8px * Theme.radius-scale;
+                        background: Theme.inset;
+                        border-width: 1px;
+                        border-color: Theme.border;
+
+                        HorizontalLayout {
+                            padding: 2px;
+                            spacing: 2px;
+
+                            // 宽度写死:FilterTab 本身只有文字那么宽,不给宽度的话
+                            // 「分屏编辑预览」六个字会挤在一起(主窗口那边是靠
+                            // horizontal-stretch 撑开的,这里没有那根弹簧)。
+                            FilterTab {
+                                label: "分屏";
+                                width: 52px;
+                                selected: AppData.md-view == MdView.split;
+                                clicked => { Logic.md-set-view(MdView.split); }
+                            }
+                            FilterTab {
+                                label: "编辑";
+                                width: 52px;
+                                selected: AppData.md-view == MdView.edit;
+                                clicked => { Logic.md-set-view(MdView.edit); }
+                            }
+                            FilterTab {
+                                label: "预览";
+                                width: 52px;
+                                selected: AppData.md-view == MdView.preview;
+                                clicked => { Logic.md-set-view(MdView.preview); }
+                            }
+                        }
+                    }
+                }
+
+                VCenter {
+                    // 收起 / 展开左边那列。单栏模式下默认是收着的(要的就是「铺满」),
+                    // 但**必须留这个开关** —— 不然「只编辑」时没法切笔记。
+                    // 图标加一层暗色:收起来的时候要看得出一眼是「没开」。
+                    IconButton {
+                        icon: @image-url("icons/list.svg");
+                        icon-size: 15px;
+                        clicked => { Logic.md-toggle-list(); }
+                    }
                 }
 
                 VCenter {
@@ -87,12 +256,81 @@ export component NotesWindow inherits Window {
         }
     }
 
-    // ── 左:源码 / 右:预览 ──
+    // ── 左:笔记库(这一层目录下的 *.md)──
     Rectangle {
+        visible: root.list-w > 0;
         x: 0;
-        y: 36px;
-        width: parent.width / 2;
-        height: parent.height - 36px;
+        y: root.bar-h;
+        width: root.list-w;
+        height: root.body-h;
+        background: Theme.inset;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        VerticalLayout {
+            // 表头:标题 + 新建
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 4px;
+                padding-top: 4px;
+                spacing: 4px;
+
+                Text {
+                    text: "笔记";
+                    font-size: 12px;
+                    font-weight: 600;
+                    color: Theme.text-dim;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                VCenter {
+                    IconButton {
+                        icon: @image-url("icons/plus.svg");
+                        icon-size: 14px;
+                        clicked => { Logic.md-new(); }
+                    }
+                }
+            }
+
+            // ScrollView + for,不用 ListView:ListView 会回收/重建行,
+            // 正在改名的那一行被回收的话输入框和焦点会一起丢掉
+            // (主窗口的任务列表是同一个理由,见 ui/app.slint)。
+            list-scroll := ScrollView {
+                vertical-stretch: 1;
+                vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+
+                VerticalLayout {
+                    width: list-scroll.visible-width;
+                    padding: 6px;
+                    spacing: 2px;
+
+                    if AppData.md-notes.length == 0 : Text {
+                        text: "还没有笔记,点上面的 + 新建一篇";
+                        font-size: 11px;
+                        color: Theme.text-dim;
+                        wrap: word-wrap;
+                    }
+
+                    for n in AppData.md-notes : NoteRow {
+                        name: n.name;
+                        selected: AppData.md-current == n.name;
+                        clicked => { Logic.md-select(n.name); }
+                        committed(new-name) => { Logic.md-rename(n.name, new-name); }
+                        remove-requested => { Logic.md-delete(n.name); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 中:源码 ──
+    Rectangle {
+        visible: root.src-w > 0;
+        x: root.list-w;
+        y: root.bar-h;
+        width: root.src-w;
+        height: root.body-h;
         background: Theme.inset;
         border-width: 1px;
         border-color: Theme.border;
@@ -122,8 +360,11 @@ export component NotesWindow inherits Window {
             }
         }
 
+        // 空的时候给一句引导。分两种:一篇都没选(库是空的),还是只是这篇还没写。
         if AppData.md-source.is-empty : Text {
-            text: "# 在这里写 Markdown\n\n右边是实时预览。Ctrl+S 或右上角「保存」存盘,\n关窗口时会自动存一次。";
+            text: AppData.md-current == ""
+                ? "# 还没有笔记\n\n左上角那列的「+」新建一篇,就在这里写 Markdown。"
+                : "# 在这里写 Markdown\n\n右边是实时预览。Ctrl+S 或右上角「保存」存盘,\n关窗口时会自动存一次。";
             color: Theme.text-dim;
             font-size: 13px;
             x: 10px;
@@ -133,16 +374,18 @@ export component NotesWindow inherits Window {
         }
     }
 
+    // ── 右:预览 ──
     md-scroll := ScrollView {
+        visible: root.prev-w > 0;
         // 不画滚动条。理由:这是 std-widgets 的 Fluent 样式滚动条,**跟系统调色板**,
         // 在本应用自己画的一套外观里非常突兀(亮色下滑块是灰的、圆角也不一样)。
         // 关掉之后滚轮/触控板照样能滚,只是看不到滑块。
         vertical-scrollbar-policy: ScrollBarPolicy.always-off;
         horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
-        x: parent.width / 2;
-        y: 36px;
-        width: parent.width - parent.width / 2;
-        height: parent.height - 36px;
+        x: root.list-w + root.src-w;
+        y: root.bar-h;
+        width: root.prev-w;
+        height: root.body-h;
 
         // 宿主的「内容变了」信号 → 滚回顶部那一下由本地属性接(见 chat.slint 里同类写法)
         property <int> blocks-tick: AppData.md-tick;
@@ -174,6 +417,42 @@ export component NotesWindow inherits Window {
             for b in AppData.md-blocks : MdBlockView {
                 block: b;
                 horizontal-stretch: 1;
+            }
+        }
+    }
+
+    // ── 底部状态栏 ──
+    //
+    // 存到哪了写在最下面一行,不挤在标题栏里:窗口最小宽只有 560px,
+    // 路径那种长文本待在标题栏会把三档切换挤变形。
+    Rectangle {
+        x: 0;
+        y: parent.height - root.foot-h;
+        width: parent.width;
+        height: root.foot-h;
+        background: Theme.card;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            spacing: 8px;
+
+            Text {
+                text: AppData.md-status;
+                font-size: 11px;
+                color: AppData.md-dirty ? Theme.accent-ink : Theme.text-dim;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Text {
+                visible: AppData.md-dirty;
+                text: "● 未保存";
+                font-size: 11px;
+                color: Theme.accent-ink;
+                vertical-alignment: center;
             }
         }
     }

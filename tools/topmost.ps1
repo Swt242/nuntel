@@ -17,7 +17,7 @@ param(
     # "on" / "off" 用字符串收,不用 [bool] —— `-File` 传参是按字符串给的,
     # `-On 1` 会变成字符串 "1",[bool] 转换直接报错(踩过)
     [string]$Mode = "on",
-    [string]$Process = "rgui-todo"
+    [string]$Process = "nuntel"
 )
 
 Add-Type @"

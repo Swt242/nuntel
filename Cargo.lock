@@ -3313,6 +3313,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuntel"
+version = "0.1.0"
+dependencies = [
+ "chinese_holiday",
+ "chrono",
+ "lunar-lite",
+ "serde",
+ "serde_json",
+ "slint",
+ "slint-build",
+ "tauri-winrt-notification",
+ "tray-icon",
+ "ureq",
+ "windows-sys 0.61.2",
+ "winreg",
+]
+
+[[package]]
 name = "objc-sys"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4394,24 +4412,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "rgui-todo"
-version = "0.1.0"
-dependencies = [
- "chinese_holiday",
- "chrono",
- "lunar-lite",
- "serde",
- "serde_json",
- "slint",
- "slint-build",
- "tauri-winrt-notification",
- "tray-icon",
- "ureq",
- "windows-sys 0.61.2",
- "winreg",
 ]
 
 [[package]]

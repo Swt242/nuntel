@@ -16,6 +16,7 @@ mod ai;
 mod calendar_info;
 mod markdown;
 mod model;
+mod notes;
 mod pet;
 mod platform;
 mod reminder;
@@ -148,6 +149,31 @@ const PET_WIDTH: f32 = 240.0;
 const PET_TICK: Duration = Duration::from_millis(40);
 /// 宠物脚底离屏幕右下角的边距(默认停靠位置)
 const PET_MARGIN: i32 = 24;
+
+/// 悬停时那一圈功能图标的几何。
+///
+/// **这几个数只有宿主知道** —— 桌宠窗口的大小就是按它们算出来的,所以 Slint
+/// 那边只消费不计算(见 `AppData.pet-ring-*`)。和 `week-card-height` 一个路子。
+const RING_ICON: f32 = 44.0; // 圆形按钮直径
+const RING_GAP: f32 = 20.0; // 按钮内边缘离宠物方块的距离
+const RING_SPREAD: f32 = 45.0; // 从正上方往两边各偏多少度
+/// 判断「鼠标还在这一圈里」时额外放宽的像素 —— 手抖不该让菜单闪掉
+const RING_SLACK: f32 = 10.0;
+
+/// 从宠物中心到图标中心的距离
+fn ring_radius(pet: f32) -> f32 {
+    pet / 2.0 + RING_GAP + RING_ICON / 2.0
+}
+
+/// 这一圈要给窗口顶上留多高。**和宠物大小无关** —— 最上面那个图标比宠物头顶
+/// 高出 `gap + icon` 那么多,宠物多大都一样。
+fn ring_band(open: bool) -> f32 {
+    if open {
+        RING_GAP + RING_ICON
+    } else {
+        0.0
+    }
+}
 
 /// 待机动画的驻留时间:每个待机动画至少播这么久才换下一个。
 ///
@@ -430,6 +456,14 @@ struct State {
     /// 桌宠窗口上一次算出来的高度。只有它变了才动窗口 ——
     /// 不然每次同步都 set_position,用户拖着的时候会被拽回去。
     pet_h: Cell<f32>,
+    /// 上一次算出来的宽度。**高度没变但宽度变了也得动窗口**(宠物调大时那一圈
+    /// 图标会撑宽窗口),所以那个「尺寸没变就不动」的短路要连它一起比。
+    pet_w: Cell<f32>,
+    /// 悬停时那一圈功能图标开着没有(见 State::tick_pet_ring)
+    pet_ring: Cell<bool>,
+    /// 刚点过这一圈里的某个图标 —— 收起来,直到鼠标离开那一圈为止。
+    /// 「选完就收」是菜单该有的样子;不这么写的话光标还停在图标上,圈会一直开着。
+    pet_ring_dismissed: Cell<bool>,
     /// AI 对话窗口
     chat: RefCell<Option<Rc<ChatWindow>>>,
     /// 对话窗那份消息模型(宿主和 UI 共用同一个 VecModel,流式时用 set_row_data 改最后一条)
@@ -453,10 +487,19 @@ struct State {
     /// 接口配置(base_url / api_key / model),单独存在 ai.json
     chat_cfg: RefCell<model::AiConfig>,
     chat_cfg_path: PathBuf,
-    /// Markdown 草稿本窗口
+    /// Markdown 笔记窗口
     notes: RefCell<Option<Rc<NotesWindow>>>,
-    /// 草稿本的文件路径(`%APPDATA%\rgui-todo\notes.md`)
-    notes_path: PathBuf,
+    /// 笔记库目录(`%APPDATA%\nuntel\notes\`)。文件系统那点事全交给 `notes` 模块,
+    /// 这里只存目录本身 —— 别的地方不要再自己拼路径。
+    notes_dir: PathBuf,
+    /// 当前打开的是哪一篇(空 = 一篇都没选)。文件名既是显示名也是 id。
+    notes_current: RefCell<String>,
+    /// 库里的文件列表(推给左边那列)
+    notes_model: Rc<VecModel<NoteItem>>,
+    /// 分屏 / 只编辑 / 只预览
+    notes_view: Cell<MdView>,
+    /// 左边那列收没收起来
+    notes_list_shown: Cell<bool>,
     /// 源码改动还没存盘
     notes_dirty: Cell<bool>,
     notes_status: RefCell<String>,
@@ -867,15 +910,18 @@ impl State {
         }
     }
 
-    /// 按当前实际观感切换:亮 -> 暗 -> 亮(不回到「跟随系统」,行为更可预期)
-    fn cycle_theme(&self) {
+    /// 切亮暗。原先主窗口标题行有个太阳/月亮按钮来回切(`cycle_theme`),
+    /// 现在改成设置窗口里「亮色 / 暗色」两个 Chip 直接指定 —— 入口和「外观主题」
+    /// 放在一起,两档也就用不着「循环」这个动作了。
+    ///
+    /// 写的是**主窗口**那份 Theme(它是唯一数据源,`push_theme` 从它读 preference),
+    /// 推给其余窗口由 `push_theme` 负责 —— 设置窗口里那两个 Chip 因此会立刻跟着变。
+    fn set_theme_preference(&self, value: ThemePreference) {
         let Some(ui) = self.ui.upgrade() else { return };
-        let next = if ui.global::<Theme>().get_dark() {
-            ThemePreference::Light
-        } else {
-            ThemePreference::Dark
-        };
-        ui.global::<Theme>().set_preference(next);
+        if ui.global::<Theme>().get_preference() == value {
+            return; // 点的就是当前这个,别白写一次盘
+        }
+        ui.global::<Theme>().set_preference(value);
         self.push_theme();
         self.save();
     }
@@ -917,6 +963,17 @@ impl State {
             theme.set_preference(preference);
             theme.set_appearance(appearance);
         }
+
+        // 桌宠也是独立窗口,而且它的气泡/输入条/悬停那一圈都吃主题色。
+        // 这条原来漏了:桌宠那份 Theme 一直停在默认值(`preference: system`),
+        // 于是**系统是亮色、应用选了暗色**时,桌宠会自己亮着 —— 新加的那圈圆形
+        // 按钮(一大片不透明底色)把这件事放大到一眼就能看见。
+        let pet = self.pet.borrow().as_ref().cloned();
+        if let Some(pet) = pet {
+            let theme = pet.global::<Theme>();
+            theme.set_preference(preference);
+            theme.set_appearance(appearance);
+        }
     }
 
     /// 切外观。改状态 → 推给两个窗口 → 跟着调窗口圆角 → 落盘。
@@ -937,8 +994,11 @@ impl State {
     fn open_settings(&self) {
         let settings = self.settings.borrow().as_ref().cloned();
         let Some(settings) = settings else { return };
-        // 两个滑杆要显示当前值 —— 设置窗口有自己那份 AppData,不推就一直是默认值
+        // 两个滑杆要显示当前值 —— 设置窗口有自己那份 AppData,不推就一直是默认值。
+        // 开机自启同理,而且它**每次都要重新读注册表**:状态可能在别处被改过
+        // (任务管理器「启动」页、别的工具),不能拿启动时读到的那份一直用。
         self.push_pet_settings();
+        self.push_autostart();
 
         // 走 reveal 而不是 show:见 reveal 的说明,直接 show 会只画一部分
         if let Err(err) = self.reveal(&*settings, platform::SETTINGS_TITLE) {
@@ -1324,11 +1384,25 @@ impl State {
     fn push_pet(&self) {
         let Some(pet) = self.pet.borrow().clone() else { return };
         let app = pet.global::<AppData>();
-        app.set_pet_size(self.pet_size.get());
+        let pet_size = self.pet_size.get();
+        app.set_pet_size(pet_size);
         app.set_pet_count(self.remaining_count());
         app.set_pet_bubble(self.pet_bubble().into());
         app.set_pet_adding(self.pet_adding.get());
+        // 那一圈图标的几何(窗口大小就是按它定的,所以只在宿主这边算)
+        app.set_pet_ring_open(self.pet_ring.get());
+        app.set_pet_ring_band(ring_band(self.pet_ring.get()));
+        app.set_pet_ring_radius(ring_radius(pet_size));
+        app.set_pet_ring_icon(RING_ICON);
+        app.set_pet_ring_spread(RING_SPREAD);
         self.push_pet_frame();
+
+        // 气泡/输入条/那一圈图标都是靠**窗口高度**让出位置的(布局贴底,多出来的
+        // 那截就长在头顶)。以前这里只推文字、不重排,于是**提醒气泡出现时窗口
+        // 还是原来那么高** —— 30px 的气泡被顶到窗口外,用户只能看到最下面一小条
+        // (桌宠头顶那条横线)。`layout_pet_window` 自己在尺寸没变时提前返回,
+        // 放在这里重复调没有代价。
+        self.layout_pet_window();
     }
 
     /// 只推当前这一帧(动画心跳每翻一帧调一次,别的状态不动)
@@ -1340,6 +1414,85 @@ impl State {
         }
     }
 
+    /// 悬停判定:鼠标在不在宠物身上 / 还在不在那一圈里。
+    ///
+    /// **为什么轮询,不用 Slint 的 `has-hover`**:
+    /// 1. 鼠标从宠物移向图标时会经过两者之间的**空隙**,`has-hover` 在那儿会闪断
+    ///    一下,菜单跟着闪 —— 得再想别的办法托底;
+    /// 2. 「输入条开着不弹」「点完收起」「鼠标还在不在圈里」这些规则本来就要宿主
+    ///    知道指针在哪;
+    /// 3. 判定只是一次圆内测试。
+    ///
+    /// 代价是最多 40ms 的延迟(PET_TICK 的周期)和 25 次/秒的 `GetCursorPos`,
+    /// 都感觉不到。
+    fn tick_pet_ring(&self) {
+        let Some(pet) = self.pet.borrow().clone() else { return };
+        if !pet.window().is_visible() {
+            return;
+        }
+
+        // 全用**物理**像素比:指针是系统的物理坐标,窗口位置/尺寸也是物理的,
+        // 而 pet-size 是逻辑的(高 DPI 上要乘缩放,不然判定区会小一圈)
+        let scale = pet.window().scale_factor() as f32;
+        let pet_px = self.pet_size.get() * scale;
+        let pos = pet.window().position();
+        let size = pet.window().size();
+        // 宠物在窗口里横向居中、贴着底边(见 ui/pet.slint 的 pet-box):
+        // 所以不管那一圈开着没有(窗口会变高),圆心都能这么算
+        let (cx, cy) = (
+            pos.x as f32 + size.width as f32 / 2.0,
+            pos.y as f32 + size.height as f32 - pet_px / 2.0,
+        );
+        let (cursor_x, cursor_y) = platform::cursor_pos();
+        let (dx, dy) = (cursor_x as f32 - cx, cursor_y as f32 - cy);
+
+        // 整圈的范围:图标摆在这个半径上,再往外放一个图标半径 + 余量
+        let hit = ring_radius(self.pet_size.get()) * scale
+            + (RING_ICON / 2.0 + RING_SLACK) * scale;
+        let in_ring = dx * dx + dy * dy <= hit * hit;
+        let in_pet = dx.abs() <= pet_px / 2.0 + 2.0 * scale && dy.abs() <= pet_px / 2.0;
+
+        // 点完图标先收着,等鼠标离开这一圈再允许重新弹
+        if !in_ring {
+            self.pet_ring_dismissed.set(false);
+        }
+
+        // 头顶有气泡/输入条时不弹:正在记事情的时候弹一排图标出来是干扰
+        let busy = self.pet_adding.get() || !self.pet_bubble().is_empty();
+        let open = self.pet_ring.get();
+        // **开**判宠物本体、**保持**判整圈 —— 这层迟滞是必须的,
+        // 不然鼠标刚往图标那边走,菜单就没了
+        let want =
+            !busy && !self.pet_ring_dismissed.get() && if open { in_ring } else { in_pet };
+        if want != open {
+            self.set_pet_ring(want);
+        }
+    }
+
+    /// 开/关那一圈图标:改状态、重排窗口(高度要跟着变)、推给 UI。
+    fn set_pet_ring(&self, open: bool) {
+        self.pet_ring.set(open);
+        self.layout_pet_window();
+        if let Some(pet) = self.pet.borrow().clone() {
+            let app = pet.global::<AppData>();
+            app.set_pet_ring_open(open);
+            app.set_pet_ring_band(ring_band(open));
+        }
+    }
+
+    /// 点了那一圈里的某个图标。开对应的窗口,然后把这圈收起来。
+    fn pet_ring_action(&self, action: &str) {
+        self.pet_ring_dismissed.set(true);
+        self.set_pet_ring(false);
+        match action {
+            "notes" => self.open_notes(),
+            "list" => self.open_task_list(),
+            "settings" => self.open_settings(),
+            // 图标是写死在 ui/pet.slint 里的,走到这儿说明两边对不上号了
+            other => platform::log(&format!("桌宠那一圈里有个不认识的图标: {other}")),
+        }
+    }
+
     /// 动画心跳:累积时间,够一帧就翻。
     fn tick_pet(&self) {
         let Some(pet) = self.pet.borrow().clone() else { return };
@@ -1347,6 +1500,9 @@ impl State {
         if !pet.window().is_visible() {
             return;
         }
+        // 顺带看一眼鼠标(放在动画逻辑前面:那段有可能提前 return)
+        self.tick_pet_ring();
+
         let (anim, frame) = self.pet_anim.get();
         let count = self.pet_frames.frame_count(anim);
         if count == 0 {
@@ -1529,18 +1685,25 @@ impl State {
         }
     }
 
-    /// 存盘。关窗口时也会走一次(不然写了一半的笔记就没了)。
+    /// 存盘。关窗口、切笔记之前都会走一次(不然写了一半的笔记就没了)。
+    ///
+    /// 存的是**当前这一篇**;一篇都没选(库是空的)就什么都不做。
     fn save_notes(&self) {
         let Some(notes) = self.notes.borrow().as_ref().cloned() else { return };
-        let source = notes.global::<AppData>().get_md_source().to_string();
-        if !self.notes_dirty.get() {
-            self.set_notes_status(&format!("已保存到 {}", self.notes_path.display()));
+        let name = self.notes_current.borrow().clone();
+        if name.is_empty() {
             return;
         }
-        match std::fs::write(&self.notes_path, &source) {
+        let source = notes.global::<AppData>().get_md_source().to_string();
+        let shown = self.note_path_text(&name);
+        if !self.notes_dirty.get() {
+            self.set_notes_status(&format!("已保存到 {shown}"));
+            return;
+        }
+        match notes::write(&self.notes_dir, &name, &source) {
             Ok(()) => {
                 self.set_notes_dirty(false);
-                self.set_notes_status(&format!("已保存到 {}", self.notes_path.display()));
+                self.set_notes_status(&format!("已保存到 {shown}"));
             }
             Err(err) => {
                 // 存不上要说清楚:用户以为存了、其实没有,那才是真的丢东西
@@ -1550,29 +1713,169 @@ impl State {
         }
     }
 
-    /// 打开草稿本(第一次进来先把文件读出来)
+    /// 某一篇的完整路径,给状态栏显示用。名字不合法时退回整个库目录。
+    fn note_path_text(&self, name: &str) -> String {
+        notes::path_in(&self.notes_dir, name)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| self.notes_dir.display().to_string())
+    }
+
+    /// 把一篇笔记的内容灌进界面(不负责保存上一篇 —— 调用方先 `save_notes`)。
+    fn load_note(&self, name: &str) {
+        let Some(notes) = self.notes.borrow().as_ref().cloned() else { return };
+        let text = notes::read(&self.notes_dir, name);
+        *self.notes_last_source.borrow_mut() = text.clone();
+        let blocks: Vec<MdBlock> = markdown::parse(&text).into_iter().map(to_ui_block).collect();
+        self.notes_blocks.set_vec(blocks);
+
+        *self.notes_current.borrow_mut() = name.to_string();
+        {
+            let app = notes.global::<AppData>();
+            app.set_md_source(text.as_str().into());
+            app.set_md_blocks(ModelRc::from(self.notes_blocks.clone()));
+            app.set_md_current(name.into());
+            app.set_md_dirty(false);
+        }
+        self.notes_dirty.set(false);
+        self.set_notes_status(&self.note_path_text(name));
+    }
+
+    /// 一篇都没选时的界面(库是空的,或者刚把当前这篇删掉)。
+    fn show_empty_note(&self) {
+        let Some(notes) = self.notes.borrow().as_ref().cloned() else { return };
+        *self.notes_current.borrow_mut() = String::new();
+        // 置成空串,免得下面这个定时器把空源码当成「改过了」又去重建一遍
+        *self.notes_last_source.borrow_mut() = String::new();
+        self.notes_blocks.set_vec(Vec::new());
+        {
+            let app = notes.global::<AppData>();
+            app.set_md_source("".into());
+            app.set_md_blocks(ModelRc::from(self.notes_blocks.clone()));
+            app.set_md_current("".into());
+            app.set_md_dirty(false);
+        }
+        self.notes_dirty.set(false);
+        self.set_notes_status(&format!("笔记库: {}", self.notes_dir.display()));
+    }
+
+    /// 把库里的文件列表推给左边那一列
+    fn push_notes_list(&self) {
+        let Some(notes) = self.notes.borrow().as_ref().cloned() else { return };
+        let names = notes::list(&self.notes_dir);
+        self.notes_model
+            .set_vec(names.iter().map(|n| NoteItem { name: n.as_str().into() }).collect::<Vec<_>>());
+        let app = notes.global::<AppData>();
+        app.set_md_notes(ModelRc::from(self.notes_model.clone()));
+        app.set_md_current(self.notes_current.borrow().as_str().into());
+    }
+
+    /// 把「分屏/单栏」和「列表收没收」推给界面
+    fn push_notes_layout(&self) {
+        if let Some(notes) = self.notes.borrow().as_ref() {
+            let app = notes.global::<AppData>();
+            app.set_md_view(self.notes_view.get());
+            app.set_md_list_shown(self.notes_list_shown.get());
+        }
+    }
+
+    /// 换一篇:**先把手上这篇存了再切**,不然改了一半的内容会被下一篇顶掉。
+    fn select_note(&self, name: &str) {
+        if name.is_empty() || *self.notes_current.borrow() == name {
+            return;
+        }
+        self.save_notes();
+        self.load_note(name);
+        // 列表里那一行的高亮是拿 md-current 比的,load_note 里已经推过了
+    }
+
+    /// 新建一篇。
+    fn new_note(&self) {
+        self.save_notes();
+        match notes::create(&self.notes_dir) {
+            Ok(name) => {
+                self.push_notes_list();
+                self.load_note(&name);
+            }
+            Err(err) => self.set_notes_status(&err),
+        }
+    }
+
+    /// 改名。名字的净化和撞名判断都在 `notes` 模块里做,失败就把话说在状态栏上。
+    fn rename_note(&self, old: &str, new: &str) {
+        match notes::rename(&self.notes_dir, old, new) {
+            Ok(clean) => {
+                // 改的是当前这篇:内容没动,只要跟着换个名字
+                if *self.notes_current.borrow() == old {
+                    *self.notes_current.borrow_mut() = clean.clone();
+                }
+                self.push_notes_list();
+                self.set_notes_status(&format!("已改名为「{clean}」"));
+            }
+            Err(err) => self.set_notes_status(&err),
+        }
+    }
+
+    /// 删掉一篇(**直接删文件**)。界面上那个按钮点了两次才会走到这儿。
+    fn delete_note(&self, name: &str) {
+        if let Err(err) = notes::remove(&self.notes_dir, name) {
+            self.set_notes_status(&err);
+            return;
+        }
+        platform::log(&format!("删掉笔记「{name}」"));
+
+        if *self.notes_current.borrow() == name {
+            // 删的就是当前这篇:先把当前清掉再挑下一篇,免得 `save_notes`
+            // 半路把刚删的内容又写回一个新文件
+            self.show_empty_note();
+            self.push_notes_list();
+            if let Some(next) = notes::most_recent(&self.notes_dir) {
+                self.load_note(&next);
+            }
+        } else {
+            self.push_notes_list();
+        }
+        self.set_notes_status(&format!("已删除「{name}」"));
+    }
+
+    /// 切 分屏 / 只编辑 / 只预览。
+    ///
+    /// 顺带把列表也收起来 —— 单栏要的就是「铺满整个窗口」。
+    /// (列表开关还能把它叫回来,不然只编辑的时候没法换笔记。)
+    fn set_notes_view(&self, view: MdView) {
+        self.notes_view.set(view);
+        self.notes_list_shown.set(view == MdView::Split);
+        self.push_notes_layout();
+    }
+
+    /// 收起 / 展开左边那列
+    fn toggle_notes_list(&self) {
+        let shown = !self.notes_list_shown.get();
+        self.notes_list_shown.set(shown);
+        self.push_notes_layout();
+    }
+
+    /// 打开笔记窗口(第一次进来就把库列出来、挑一篇打开)
     fn open_notes(&self) {
         let Some(notes) = self.notes.borrow().as_ref().cloned() else {
             platform::log("笔记窗口没建起来");
             return;
         };
-        // 读盘:文件不在就是第一次,给一段示例内容当引导
-        let text = std::fs::read_to_string(&self.notes_path).unwrap_or_else(|_| {
-            "# 欢迎
-\n这是 Markdown 草稿本,左边写、右边实时预览。\n\n- 支持**加粗**、*斜体*、`行内代码`\n- 支持清单\n- 还有代码块:\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\n> 引用、分隔线、表格也能渲染。\n\n---\n\n| 快捷键 | 作用 |\n|---|---|\n| Ctrl+S | 保存 |\n".to_string()
-        });
-        *self.notes_last_source.borrow_mut() = text.clone();
-        let blocks: Vec<MdBlock> = markdown::parse(&text).into_iter().map(to_ui_block).collect();
-        self.notes_blocks.set_vec(blocks);
+        // 老的单文件笔记搬进库。搬完老文件就没了,所以这个调用天然只生效一次。
+        notes::migrate_legacy(&self.notes_dir);
 
-        {
-            let app = notes.global::<AppData>();
-            app.set_md_source(text.as_str().into());
-            app.set_md_blocks(ModelRc::from(self.notes_blocks.clone()));
-            app.set_md_status(format!("文件: {}", self.notes_path.display()).as_str().into());
-            app.set_md_dirty(false);
+        let current = self.notes_current.borrow().clone();
+        if !current.is_empty() {
+            // 选过(窗口关掉又打开):重新从盘上读一次,别拿内存里的旧副本
+            self.load_note(&current);
+        } else if let Some(name) = notes::most_recent(&self.notes_dir) {
+            self.load_note(&name);
+        } else {
+            // 库是空的。**不自动新建** —— 用户可能刚把笔记全删了,
+            // 一进来又冒出一篇会很烦。空状态里有「+」,点一下就有。
+            self.show_empty_note();
         }
-        self.notes_dirty.set(false);
+        self.push_notes_list();
+        self.push_notes_layout();
 
         self.layout_notes_window();
         if let Err(err) = self.reveal(&*notes, platform::NOTES_TITLE) {
@@ -1610,38 +1913,76 @@ impl State {
         }
     }
 
-    /// 把一段 Markdown 追加到草稿本末尾(AI 回复旁边的「存到笔记」)。
+    /// 把一段 Markdown 追加到笔记末尾(AI 回复旁边的「存到笔记」)。
     ///
-    /// 走的是**同一个文件**:先读盘(以盘上的为准,免得窗口没开过、内存里是空的),
-    /// 追加,再存回去并刷新预览。
+    /// **落到哪一篇**:窗口开着就写它正在显示的那篇;没开过就挑最近改过的那篇;
+    /// 库是空的就现建一篇。落点必须可预期 —— 每按一次就冒出一篇新笔记是最糟的。
     fn append_to_notes(&self, text: &str) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
-        let mut current = std::fs::read_to_string(&self.notes_path).unwrap_or_default();
-        if !current.is_empty() && !current.ends_with('\n') {
-            current.push('\n');
-        }
-        current.push_str("\n---\n\n");
-        current.push_str(text);
-        current.push('\n');
 
-        if let Err(err) = std::fs::write(&self.notes_path, &current) {
+        let target = match self.notes_current.borrow().as_str() {
+            "" => match notes::most_recent(&self.notes_dir) {
+                Some(name) => name,
+                None => match notes::create(&self.notes_dir) {
+                    Ok(name) => name,
+                    Err(err) => {
+                        platform::log(&format!("追加到笔记失败: {err}"));
+                        return;
+                    }
+                },
+            },
+            name => name.to_string(),
+        };
+
+        // 窗口正开着这一篇的话,**以界面上的为准**(可能还有没存盘的改动),
+        // 别去盘上读一份旧的回来把它顶掉。
+        //
+        // 句柄先 clone 出来再读属性,别抱着 `RefCell` 的借用去调 Slint ——
+        // 读属性会跑绑定,万一哪条绑定绕回来又要借 notes,就直接 panic 了
+        // (push_theme 里踩过同一个坑)。
+        let open_here = {
+            let current = self.notes_current.borrow().clone();
+            let window = self.notes.borrow().as_ref().cloned();
+            match window {
+                Some(notes) if current == target => {
+                    Some(notes.global::<AppData>().get_md_source().to_string())
+                }
+                _ => None,
+            }
+        };
+
+        let mut body = open_here.unwrap_or_else(|| notes::read(&self.notes_dir, &target));
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str("\n---\n\n");
+        body.push_str(text);
+        body.push('\n');
+
+        if let Err(err) = notes::write(&self.notes_dir, &target, &body) {
             platform::log(&format!("追加到笔记失败: {err}"));
             return;
         }
-        // 草稿本开着的话同步刷新(不然它显示的还是旧内容)
-        if let Some(notes) = self.notes.borrow().as_ref().cloned() {
+
+        // 开着的那篇同步刷新(不然它显示的还是旧内容)
+        if let Some(notes) = self.notes.borrow().as_ref().cloned()
+            && *self.notes_current.borrow() == target
+        {
             let app = notes.global::<AppData>();
-            app.set_md_source(current.as_str().into());
+            app.set_md_source(body.as_str().into());
             let blocks: Vec<MdBlock> =
-                markdown::parse(&current).into_iter().map(to_ui_block).collect();
+                markdown::parse(&body).into_iter().map(to_ui_block).collect();
             self.notes_blocks.set_vec(blocks);
             app.set_md_blocks(ModelRc::from(self.notes_blocks.clone()));
-            *self.notes_last_source.borrow_mut() = current.clone();
+            *self.notes_last_source.borrow_mut() = body.clone();
+            self.notes_dirty.set(false);
         }
-        let _ = self.notes_dirty.set(false);
+        // 新建过的话列表得跟着更新
+        self.push_notes_list();
+        self.set_notes_status(&format!("已追加到「{target}」"));
     }
 
     /// 摆在主窗口旁边(居中于屏幕,和主窗口错开一点)
@@ -2147,21 +2488,28 @@ impl State {
         let Some(pet) = self.pet.borrow().clone() else { return };
         let app = pet.global::<AppData>();
 
-        // 高度 = 宠物 + 顶部给角标留的余量 + 气泡/输入条
+        // 高度 = 宠物 + 顶部给角标留的余量 + 那一圈图标要的高度 + 气泡/输入条
         let pet_size = self.pet_size.get();
-        let mut h = pet_size + 18.0;
+        let band = ring_band(self.pet_ring.get());
+        let mut h = pet_size + 18.0 + band;
         if !app.get_pet_bubble().is_empty() {
             h += 36.0;
         }
         if self.pet_adding.get() {
             h += 42.0;
         }
-        let w = PET_WIDTH.max(pet_size + 24.0);
+        // 宽度:除了给气泡/输入条留位置,还得容得下 ±spread 那两个图标
+        // (宠物调到最大时 240 就不够了,会往外撑)
+        let r = ring_radius(pet_size);
+        let reach = r * RING_SPREAD.to_radians().sin() + RING_ICON / 2.0 + 6.0;
+        let w = PET_WIDTH.max(pet_size + 24.0).max(reach * 2.0);
 
-        // 高度没变就别动窗口:否则每次同步都 set_position,
-        // 用户正拖着的时候会被拽回原处。
+        // 尺寸没变就别动窗口:否则每次同步都 set_position,
+        // 用户正拖着的时候会被拽回原处。**宽高都要比** —— 只比高度的话,
+        // 「宠物调大 → 环把窗口撑宽」这条路径会被这条短路吞掉。
         let old_h = self.pet_h.get();
-        if old_h > 0.0 && (h - old_h).abs() < 0.5 {
+        let old_w = self.pet_w.get();
+        if old_h > 0.0 && (h - old_h).abs() < 0.5 && (w - old_w).abs() < 0.5 {
             return;
         }
 
@@ -2176,7 +2524,9 @@ impl State {
         let x = if first {
             (wx + ww - w as i32 - PET_MARGIN) as f32
         } else {
-            pos.x as f32
+            // 宽度变了要让 x 反向补一半:宠物在窗口里是**居中**的,
+            // 只往右长的话它会跟着往右挪,在屏幕上横着跳一下
+            pos.x as f32 - (w - old_w) / 2.0
         };
         let bottom = if first {
             (wy + wh - PET_MARGIN) as f32
@@ -2184,6 +2534,7 @@ impl State {
             pos.y as f32 + old_h
         };
         self.pet_h.set(h);
+        self.pet_w.set(w);
 
         pet.window().set_size(slint::LogicalSize::new(w, h));
         pet.window()
@@ -2458,21 +2809,25 @@ impl State {
 
     // ── 设置 ──────────────────────────────────────────────────────────
 
-    fn set_autostart(&self, enabled: bool) {
-        match platform::set_autostart(enabled) {
-            Ok(()) => {
-                if let Some(ui) = self.ui.upgrade() {
-                    ui.global::<AppData>().set_autostart(platform::autostart_enabled());
-                }
-            }
-            Err(err) => {
-                platform::log(&format!("设置开机自启失败: {err}"));
-                if let Some(ui) = self.ui.upgrade() {
-                    // 写失败就把开关拨回去
-                    ui.global::<AppData>().set_autostart(platform::autostart_enabled());
-                }
-            }
+    /// 把「开机自启」的**真实状态**推给设置窗口。
+    ///
+    /// 每次都去读注册表,而不是记住用户刚点的那个值:写注册表**可能失败**
+    /// (企业策略、权限),失败时开关必须拨回去 —— 停在一个骗人的状态上,
+    /// 用户下次开机发现没启动,会以为是自己没点。
+    fn push_autostart(&self) {
+        let enabled = platform::autostart_enabled();
+        let settings = self.settings.borrow().as_ref().cloned();
+        if let Some(settings) = settings {
+            settings.global::<AppData>().set_autostart(enabled);
         }
+    }
+
+    fn set_autostart(&self, enabled: bool) {
+        if let Err(err) = platform::set_autostart(enabled) {
+            platform::log(&format!("设置开机自启失败: {err}"));
+        }
+        // 成功失败都按注册表的实际结果回推(失败了开关自动弹回去)
+        self.push_autostart();
     }
 
     /// 窗口尺寸变了就调整日历的详略。
@@ -2881,6 +3236,12 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     }
 
+    // ⚠️ **这两件必须放在最前面,连日志都不能先写**:日志、待办、笔记、AI 配置
+    // 全在数据目录下,晚一步就会先在新目录里建出文件来,那时搬迁会直接放弃
+    // (见 model::migrate_old_data_dirs 的说明)—— 表现就是「任务和笔记全没了」。
+    model::migrate_old_data_dirs();
+    platform::migrate_autostart();
+
     platform::rotate_log_if_needed();
     platform::log("---- 启动 ----");
 
@@ -2954,6 +3315,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 | 1, // 种子不能是 0
         ),
         pet_h: Cell::new(0.0),
+        pet_w: Cell::new(0.0),
+        pet_ring: Cell::new(false),
+        pet_ring_dismissed: Cell::new(false),
         repaint_timers: RefCell::new(Vec::new()),
         chat: RefCell::new(None),
         chat_model: Rc::new(VecModel::default()),
@@ -2966,7 +3330,12 @@ fn main() -> Result<(), slint::PlatformError> {
         chat_scroll_tick: Cell::new(0),
         chat_config_open: Cell::new(false),
         notes: RefCell::new(None),
-        notes_path: model::notes_file(),
+        notes_dir: notes::notes_dir(),
+        notes_current: RefCell::new(String::new()),
+        notes_model: Rc::new(VecModel::default()),
+        // 默认分屏 + 显示列表:进来先看得见「有哪几篇」,再决定要不要铺满
+        notes_view: Cell::new(MdView::Split),
+        notes_list_shown: Cell::new(true),
         notes_dirty: Cell::new(false),
         notes_status: RefCell::new(String::new()),
         notes_blocks: Rc::new(VecModel::default()),
@@ -3004,7 +3373,6 @@ fn main() -> Result<(), slint::PlatformError> {
         // 两套选择器用哪一套,由 USE_NATIVE_PICKERS 这个常量决定
         app.set_use_native_pickers(USE_NATIVE_PICKERS);
         app.set_week_days(ModelRc::from(state.week_model.clone()));
-        app.set_autostart(platform::autostart_enabled());
     }
     ui.global::<Theme>().set_preference(theme_to_ui(data.theme));
 
@@ -3044,10 +3412,6 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let s = state.clone();
         ui.global::<Logic>().on_cancel_edit(move || s.set_editing(-1));
-    }
-    {
-        let s = state.clone();
-        ui.global::<Logic>().on_cycle_theme(move || s.cycle_theme());
     }
     {
         let s = state.clone();
@@ -3141,10 +3505,6 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let s = state.clone();
-        ui.global::<Logic>().on_set_autostart(move |on| s.set_autostart(on));
-    }
-    {
-        let s = state.clone();
         ui.global::<Logic>().on_open_settings(move || s.open_settings());
     }
     // ── 无边框窗口的标题栏 ──
@@ -3177,6 +3537,18 @@ fn main() -> Result<(), slint::PlatformError> {
             {
                 let s = state.clone();
                 settings.global::<Logic>().on_set_appearance(move |value| s.set_appearance(value));
+            }
+            {
+                // 亮暗和外观一样挂在设置窗口上。宿主只写主窗口那份 Theme,
+                // 其余窗口由 push_theme 推 —— 设置窗口里那两个 Chip 因此立刻跟着变。
+                let s = state.clone();
+                settings.global::<Logic>()
+                    .on_set_theme_preference(move |value| s.set_theme_preference(value));
+            }
+            {
+                // 开机自启原来在主窗口底栏,和「外观 / 亮暗」一起收进设置里了
+                let s = state.clone();
+                settings.global::<Logic>().on_set_autostart(move |on| s.set_autostart(on));
             }
             {
                 let s = state.clone();
@@ -3225,6 +3597,11 @@ fn main() -> Result<(), slint::PlatformError> {
                     let s = state.clone();
                     pet.global::<Logic>()
                         .on_pet_badge_clicked(move || s.pet_badge_clicked());
+                }
+                {
+                    let s = state.clone();
+                    pet.global::<Logic>()
+                        .on_pet_ring_action(move |action| s.pet_ring_action(&action));
                 }
                 {
                     let s = state.clone();
@@ -3328,6 +3705,31 @@ fn main() -> Result<(), slint::PlatformError> {
                 let s = state.clone();
                 notes.global::<Logic>().on_md_open(move || s.open_notes());
             }
+            // 笔记库:换一篇 / 新建 / 改名 / 删除 / 换视图 / 收列表
+            {
+                let s = state.clone();
+                notes.global::<Logic>().on_md_select(move |name| s.select_note(&name));
+            }
+            {
+                let s = state.clone();
+                notes.global::<Logic>().on_md_new(move || s.new_note());
+            }
+            {
+                let s = state.clone();
+                notes.global::<Logic>().on_md_rename(move |old, new| s.rename_note(&old, &new));
+            }
+            {
+                let s = state.clone();
+                notes.global::<Logic>().on_md_delete(move |name| s.delete_note(&name));
+            }
+            {
+                let s = state.clone();
+                notes.global::<Logic>().on_md_set_view(move |view| s.set_notes_view(view));
+            }
+            {
+                let s = state.clone();
+                notes.global::<Logic>().on_md_toggle_list(move || s.toggle_notes_list());
+            }
             // 点 ✕ 也走「先存再藏」那条路(别让用户白写)
             {
                 let s = state.clone();
@@ -3378,7 +3780,12 @@ fn main() -> Result<(), slint::PlatformError> {
     // 藏起来 —— 托盘图标是 tray-icon crate 建的,Slint 并不知道它的存在,所以
     // 用 ui.run() 的话关窗就等于退出进程,托盘常驻就废了。
     // 退出的唯一入口是托盘菜单里的「退出」。
-    state.reveal(&ui, platform::WINDOW_TITLE)?;
+    //
+    // ⚠️ **这里故意不显示主窗口**(`state.reveal(&ui, ...)` 被拿掉了):
+    // 桌宠才是入口,任务清单/笔记/设置都从它悬停弹出来的那一圈进(见 §28)。
+    // AppWindow 照建不误 —— 所有回调都捕获了它,只是先不上屏。
+    // 第一次真正显示时走的是同一个 `reveal`,所以「启动只画一半」那个修法
+    // (§23.1)照常生效,它本来就是为「第一次映射」写的。
 
     // 桌宠:先摆好位置再显示,免得先在屏幕中间闪一下
     if let Some(pet) = state.pet.borrow().clone().filter(|_| state.show_pet.get()) {

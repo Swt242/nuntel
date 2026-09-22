@@ -6,7 +6,7 @@
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/occlude.ps1
 param(
-  [string]$Process = "rgui-todo",
+  [string]$Process = "nuntel",
   [int]$X = 1600,
   [int]$Y = 300,
   [string]$Prefix = "E:\work\rgui\tmp\oc"

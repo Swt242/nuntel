@@ -54,8 +54,8 @@ Start-Sleep -Milliseconds 150
 Start-Sleep -Milliseconds 300
 Report "after"
 
-$procs = Get-Process -Name rgui-todo -ErrorAction SilentlyContinue
+$procs = Get-Process -Name nuntel -ErrorAction SilentlyContinue
 foreach ($p in $procs) {
   $p.Refresh()
-  Write-Output ("  rgui-todo pid {0} mainwindowhandle {1}" -f $p.Id, $p.MainWindowTitle)
+  Write-Output ("  nuntel pid {0} mainwindowhandle {1}" -f $p.Id, $p.MainWindowTitle)
 }

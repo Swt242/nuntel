@@ -7,7 +7,7 @@
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/uiclick.ps1 -ClickXs 296,308,320 -ClickY 18
 param(
-  [string]$Process = "rgui-todo",
+  [string]$Process = "nuntel",
   [int]$ParkX = 1600,
   [int]$ParkY = 60,
   [string]$ClickXs = "296,308,320",

@@ -13,7 +13,7 @@
 // 4. 帧由宿主逐帧推(`pet-frame`),Slint 的 Image 不会自己播动图。
 
 import {
-    AppData, IconButton, Logic, PanelEdge, Theme, VCenter,
+    AppData, IconButton, Logic, PanelEdge, RingButton, Theme, VCenter,
 } from "widgets.slint";
 
 export component PetWindow inherits Window {
@@ -121,45 +121,125 @@ export component PetWindow inherits Window {
             }
         }
 
-        // ── 宠物本体 ──
+        // ── 宠物本体 + 悬停弹出来的那一圈功能图标 ──
+        //
+        // 宠物和那一圈图标**放在同一个盒子里**,不是拆成两个布局子项:
+        // ±spread 度的那两个图标本来就会盖到宠物方块顶部两角(实测那里没有像素,
+        // 挡不到宠物),而它们的位置又是相对**宠物中心**算的 —— 放同一个盒子里,
+        // 所有元素都在自己父元素的范围内,不用去赌「父元素之外的子元素还能不能
+        // 收鼠标事件」。
+        //
+        // 环没开的时候 `pet-ring-band` 是 0,盒子高度就是宠物本身,和以前一样。
         Rectangle {
-            height: AppData.pet-size * 1px;
+            height: (AppData.pet-size + AppData.pet-ring-band) * 1px;
             background: transparent;
 
-            HorizontalLayout {
-                alignment: center;
+            // 这一圈图标的圆心 —— 就是宠物方块的中心(宠物横向居中、贴着盒底)
+            private property <length> ring-cx: self.width / 2;
+            private property <length> ring-cy: self.height - AppData.pet-size * 1px / 2;
+            private property <length> ring-r: AppData.pet-ring-radius * 1px;
+            private property <length> ring-half: AppData.pet-ring-icon * 1px / 2;
+            /// 两边那两个图标各自偏离正上方多少度
+            private property <angle> ring-tilt: AppData.pet-ring-spread * 1deg;
 
-                pet-body := Rectangle {
-                    width: AppData.pet-size * 1px;
-                    height: AppData.pet-size * 1px;
-                    background: transparent;
+            pet-body := Rectangle {
+                width: AppData.pet-size * 1px;
+                height: AppData.pet-size * 1px;
+                // 横向居中、贴着盒底(盒子比宠物高出来的那部分就是给这一圈留的)
+                x: (parent.width - self.width) / 2;
+                y: parent.height - self.height;
+                background: transparent;
 
-                    // **这里不能用 WindowMoveArea**(踩过的坑:桌宠死活拖不动)。
-                    // 它靠 `input_event_filter_before_children` 拿到按下,而之后的
-                    // Moved 只发给「按下时抓住鼠标的那个元素」及其祖先 —— 宠物身上
-                    // 必须有个 TouchArea 接单击/双击,按下会被它抓走,于是
-                    // WindowMoveArea 再也收不到 Moved,`start_window_move()` 永远不触发。
-                    // (对照:主窗口标题栏没有 TouchArea,所以那边一直好使。)
-                    //
-                    // 拖动改由宿主算:按下时记下「指针 + 窗口」的全局位置,拖动时按指针
-                    // 的**全局**位移挪窗口。不能用 mouse-x 那类窗口内坐标 —— 窗口跟着
-                    // 指针走,窗口内的相对位置根本不变。
-                    Image {
-                        source: AppData.pet-frame;
-                        width: parent.width;
-                        height: parent.height;
+                // **这里不能用 WindowMoveArea**(踩过的坑:桌宠死活拖不动)。
+                // 它靠 `input_event_filter_before_children` 拿到按下,而之后的
+                // Moved 只发给「按下时抓住鼠标的那个元素」及其祖先 —— 宠物身上
+                // 必须有个 TouchArea 接单击/双击,按下会被它抓走,于是
+                // WindowMoveArea 再也收不到 Moved,`start_window_move()` 永远不触发。
+                // (对照:主窗口标题栏没有 TouchArea,所以那边一直好使。)
+                //
+                // 拖动改由宿主算:按下时记下「指针 + 窗口」的全局位置,拖动时按指针
+                // 的**全局**位移挪窗口。不能用 mouse-x 那类窗口内坐标 —— 窗口跟着
+                // 指针走,窗口内的相对位置根本不变。
+                Image {
+                    source: AppData.pet-frame;
+                    width: parent.width;
+                    height: parent.height;
+                }
+
+                // 单击 / 双击 / 拖动都归它。
+                //
+                // ⚠️ **单击不能就地执行**:双击的第一下也是单击,而单击会把
+                // 快速添加输入条打开 —— 窗口跟着变高,Slint 的双击判定就此断掉,
+                // 结果就是「双击打不开对话窗,反倒开了个输入条」(实测)。
+                // 所以单击发给宿主之后**延迟 250ms** 再执行,这期间来了双击就取消。
+                // 拖动**不会**顺带触发 clicked:TouchArea 的 clicked 只在
+                // 「按下和松开都在本区域内」时发,真拖起来之后窗口跟着指针走,
+                // 松手时指针还在宠物上 —— 所以那道判断交给宿主(见 State::pet_just_dragged)。
+                pet-touch := TouchArea {
+                    mouse-cursor: pointer;
+
+                    changed pressed => {
+                        if (self.pressed) {
+                            Logic.pet-drag-begin(
+                                self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y,
+                            );
+                        } else {
+                            Logic.pet-drag-end();
+                        }
+                    }
+                    moved => { Logic.pet-drag-slide(); }
+                    double-clicked => { Logic.pet-double-clicked(); }
+                    clicked => { Logic.pet-clicked(); }
+                }
+
+                // 未完成数角标。贴在右上角、允许溢出边界 —— clip 默认是关的,正好。
+                //
+                // **必须排在 pet-touch 后面**:Slint 里同层靠后的元素压在上面,
+                // 也才先拿到鼠标事件。放在前面的话这一小块会被 pet-touch 盖住,
+                // 点上去只会走到「展开输入条」那条路。
+                //
+                // 那一圈图标开着的时候**藏起来**:+spread 度那个「设置」图标正好
+                // 压在这个角上,而且那时候数字已经挪到「清单」图标上去了。
+                if AppData.pet-count > 0 && !AppData.pet-ring-open : Rectangle {
+                    width: badge-text.width + 12px;
+                    height: 20px;
+                    border-radius: 10px * Theme.radius-scale;
+                    background: Theme.danger;
+                    // 白色细环而不是 Theme.bg:窗口是透明的,
+                    // 拿不透明的主题底色描边会凭空出现一圈方块
+                    border-width: 2px;
+                    border-color: #ffffffd9;
+                    x: parent.width - self.width + 6px;
+                    y: -4px;
+
+                    badge-text := Text {
+                        text: AppData.pet-count > 99 ? "99+" : "\{AppData.pet-count}";
+                        font-size: 11px;
+                        font-weight: 700;
+                        color: #ffffff;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        x: 6px;
+                        y: (parent.height - self.height) / 2;
                     }
 
-                    // 单击 / 双击 / 拖动都归它。
+                    // 点红点 = 看这 N 条到底是什么。
                     //
-                    // ⚠️ **单击不能就地执行**:双击的第一下也是单击,而单击会把
-                    // 快速添加输入条打开 —— 窗口跟着变高,Slint 的双击判定就此断掉,
-                    // 结果就是「双击打不开对话窗,反倒开了个输入条」(实测)。
-                    // 所以单击发给宿主之后**延迟 250ms** 再执行,这期间来了双击就取消。
-                    // 拖动**不会**顺带触发 clicked:TouchArea 的 clicked 只在
-                    // 「按下和松开都在本区域内」时发,真拖起来之后窗口跟着指针走,
-                    // 松手时指针还在宠物上 —— 所以那道判断交给宿主(见 State::pet_just_dragged)。
-                    pet-touch := TouchArea {
+                    // 拖动那几个回调也照接:只吃点击不认拖动的话,宠物的右上角
+                    // 会变成一块「按住拖不动」的死区(角标有 20px 高,宠物调小之后
+                    // 那一块并不小)。
+                    //
+                    // ⚠️ 基准点必须用 **`self.absolute-position`**,不能像旁边
+                    // pet-touch 那样写 `pet-body.absolute-position`。`mouse-x` 是
+                    // 相对**本元素**的 —— 这个 TouchArea 只有角标那么大,和 pet-body
+                    // 差着一个角标的偏移,加起来得到的指针位置就偏了。偏的后果不是
+                    // 「拖不动」而是**拖歪**:y 大致还对、x 直接反向(实测从红点拖
+                    // -150px,宠物反而往右挪了 9px)。pet-touch 正巧铺满 pet-body,
+                    // 两个写法等价,所以这个坑只有这里踩得到。
+                    TouchArea {
+                        width: parent.width;
+                        height: parent.height;
                         mouse-cursor: pointer;
 
                         changed pressed => {
@@ -173,71 +253,56 @@ export component PetWindow inherits Window {
                             }
                         }
                         moved => { Logic.pet-drag-slide(); }
-                        double-clicked => { Logic.pet-double-clicked(); }
-                        clicked => { Logic.pet-clicked(); }
-                    }
-
-                    // 未完成数角标。贴在右上角、允许溢出边界 —— clip 默认是关的,正好。
-                    //
-                    // **必须排在 pet-touch 后面**:Slint 里同层靠后的元素压在上面,
-                    // 也才先拿到鼠标事件。放在前面的话这一小块会被 pet-touch 盖住,
-                    // 点上去只会走到「展开输入条」那条路。
-                    if AppData.pet-count > 0 : Rectangle {
-                        width: badge-text.width + 12px;
-                        height: 20px;
-                        border-radius: 10px * Theme.radius-scale;
-                        background: Theme.danger;
-                        // 白色细环而不是 Theme.bg:窗口是透明的,
-                        // 拿不透明的主题底色描边会凭空出现一圈方块
-                        border-width: 2px;
-                        border-color: #ffffffd9;
-                        x: parent.width - self.width + 6px;
-                        y: -4px;
-
-                        badge-text := Text {
-                            text: AppData.pet-count > 99 ? "99+" : "\{AppData.pet-count}";
-                            font-size: 11px;
-                            font-weight: 700;
-                            color: #ffffff;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                            x: 6px;
-                            y: (parent.height - self.height) / 2;
-                        }
-
-                        // 点红点 = 看这 N 条到底是什么。
-                        //
-                        // 拖动那几个回调也照接:只吃点击不认拖动的话,宠物的右上角
-                        // 会变成一块「按住拖不动」的死区(角标有 20px 高,宠物调小之后
-                        // 那一块并不小)。
-                        //
-                        // ⚠️ 基准点必须用 **`self.absolute-position`**,不能像旁边
-                        // pet-touch 那样写 `pet-body.absolute-position`。`mouse-x` 是
-                        // 相对**本元素**的 —— 这个 TouchArea 只有角标那么大,和 pet-body
-                        // 差着一个角标的偏移,加起来得到的指针位置就偏了。偏的后果不是
-                        // 「拖不动」而是**拖歪**:y 大致还对、x 直接反向(实测从红点拖
-                        // -150px,宠物反而往右挪了 9px)。pet-touch 正巧铺满 pet-body,
-                        // 两个写法等价,所以这个坑只有这里踩得到。
-                        TouchArea {
-                            width: parent.width;
-                            height: parent.height;
-                            mouse-cursor: pointer;
-
-                            changed pressed => {
-                                if (self.pressed) {
-                                    Logic.pet-drag-begin(
-                                        self.absolute-position.x + self.mouse-x,
-                                        self.absolute-position.y + self.mouse-y,
-                                    );
-                                } else {
-                                    Logic.pet-drag-end();
-                                }
-                            }
-                            moved => { Logic.pet-drag-slide(); }
-                            clicked => { Logic.pet-badge-clicked(); }
-                        }
+                        clicked => { Logic.pet-badge-clicked(); }
                     }
                 }
+            }
+
+            // ── 悬停弹出的一圈功能图标 ──
+            //
+            // 摆在宠物中心的**上半圈**上:正上方一个,两边各偏 `pet-ring-spread` 度。
+            // 为什么只做上半圈:桌宠默认停在屏幕右下角,下半圈会伸到屏幕外和任务栏里;
+            // 上半圈只让窗口往上、往两边长。
+            //
+            // **必须排在 pet-body 后面**:同层靠后的元素压在上面、也先拿到鼠标事件。
+            // 排在前面的话,±spread 那两个跟宠物方块角落重叠的部分就点不到了
+            // (这条和角标那条是同一个规矩)。
+            //
+            // 坐标是从**宠物中心**推的,不是从盒子顶:宠物贴底,盒子高出来的那截
+            // 全在头顶,所以圆心要用 `ring-cy` 而不是 height/2。
+            RingButton {
+                icon: @image-url("icons/note.svg");
+                label: "笔记";
+                size: AppData.pet-ring-icon * 1px;
+                shown: AppData.pet-ring-open;
+                x: ring-cx + ring-r * Math.sin(-ring-tilt) - ring-half;
+                y: ring-cy - ring-r * Math.cos(-ring-tilt) - ring-half;
+                clicked => { Logic.pet-ring-action("notes"); }
+            }
+
+            RingButton {
+                icon: @image-url("icons/list.svg");
+                label: "清单";
+                size: AppData.pet-ring-icon * 1px;
+                shown: AppData.pet-ring-open;
+                // 未完成数挂在这个图标上:环一打开,宠物自己那个角标就藏起来
+                // (不然 +45° 的图标和它正好叠在一起)
+                badge: AppData.pet-count > 0
+                    ? (AppData.pet-count > 99 ? "99+" : "\{AppData.pet-count}")
+                    : "";
+                x: ring-cx - ring-half;
+                y: ring-cy - ring-r - ring-half;
+                clicked => { Logic.pet-ring-action("list"); }
+            }
+
+            RingButton {
+                icon: @image-url("icons/settings.svg");
+                label: "设置";
+                size: AppData.pet-ring-icon * 1px;
+                shown: AppData.pet-ring-open;
+                x: ring-cx + ring-r * Math.sin(ring-tilt) - ring-half;
+                y: ring-cy - ring-r * Math.cos(ring-tilt) - ring-half;
+                clicked => { Logic.pet-ring-action("settings"); }
             }
         }
     }
