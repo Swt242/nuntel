@@ -10,3 +10,8 @@ tmp/
 
 # Python 的字节码缓存(排查脚本被 import 时会生成)
 __pycache__/
+
+# 编辑器的工程目录(顺手改个配置就会冒出一堆)
+.idea/
+.vscode/
+*.iml
