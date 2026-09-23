@@ -5,7 +5,7 @@
 //
 // 分工见 src/markdown.rs 顶部:Rust 切块级,行内样式交给 Slint 的 StyledText。
 
-import { MdBlock, MdCell, MdKind, Theme } from "widgets.slint";
+import { MdBlock, MdCell, MdKind, Theme, TodoCheck, VCenter } from "widgets.slint";
 
 /// 一块的渲染。
 ///
@@ -20,6 +20,12 @@ import { MdBlock, MdCell, MdKind, Theme } from "widgets.slint";
 export component MdBlockView inherits Rectangle {
     in property <MdBlock> block: { kind: MdKind.rich, text: @markdown(""), raw: "", lang: "", level: 1, cells: [] };
 
+    /// 点了图片 —— 交给宿主(笔记窗口)去开「看原图」浮层。
+    /// 参数是 **图 / alt / 原始宽 / 原始高**:宿主不必再去翻是哪一块、也不用自己量
+    callback image-clicked(image, string, length, length);
+    /// 点了任务勾选框。转发的是**源码行号**,宿主去改那一行
+    callback task-toggled(int);
+
     background: transparent;
     // 内容高度 + 块之间那点间距(各元素统一从 y=0 开始)
     height: block.kind == MdKind.rich ? rich-text.preferred-height + 16px
@@ -27,6 +33,8 @@ export component MdBlockView inherits Rectangle {
         : block.kind == MdKind.code ? code-box.height + 10px
         : block.kind == MdKind.quote ? quote-text.preferred-height + 18px
         : block.kind == MdKind.table ? table-box.height + 10px
+        : block.kind == MdKind.image ? image-box.height + 14px
+        : block.kind == MdKind.tasks ? tasks-box.height + 12px
         : 21px;
 
     // ── 段落 / 列表(行内样式交给 StyledText)──
@@ -129,7 +137,21 @@ export component MdBlockView inherits Rectangle {
     // 这里用 GridLayout 摆成真网格 —— 列能对齐、表头有底色,比等宽文本块好读得多。
     // 代价是单元格里的行内样式不生效(单元格是纯 Text),这一点与标题同理。
     //
-    // 列宽按内容自适应(hug):想让它们铺满整宽得逐列算,不值得;表格通常也不长。
+    // ⚠️ **列宽是均分的**(不再是「按内容自适应」)。改的理由是**换行**:要让长单元格
+    // 折行,就得先给它一个**确定的宽度**,而 GridLayout 的自动列宽是跟着内容走的 ——
+    // 只要那一列里有长文本,它就永远不折(实测:一行长说明会把整张表顶出预览栏)。
+    // 均分是最简单的确定宽度。代价:内容长短悬殊的表格不如以前紧凑。
+    private property <length> table-cell-w: (self.width - 16px - (max(1, block.table-cols) - 1) * 1px)
+        / max(1, block.table-cols);
+
+    // 图片:等比缩到栏宽。**高度必须跟着一起缩** —— Rust 那边只按 560 的上限算,
+    // 预览栏比 560 窄时这儿得再缩一次;不缩的话 `image-fit: contain` 会在图下面
+    // 留一大块空白(实测:2560×1440 的截图在 270px 宽的栏里,下面空了 150px)。
+    private property <length> image-w: min(block.image-width, self.width);
+    private property <length> image-h: block.image-width > 0px
+        ? block.image-height * (self.image-w / block.image-width)
+        : 0px;
+
     table-box := Rectangle {
         visible: block.kind == MdKind.table;
         width: parent.width;
@@ -149,21 +171,150 @@ export component MdBlockView inherits Rectangle {
             spacing: 1px;
 
             // 单元格是扁平的一维模型,靠 row/column 显式定位 —— 列就能对齐
+            //
+            // ⚠️ **高度必须自己算**(和本文件里 code-box 一个道理):GridLayout 是按
+            // 每个条目报的 `preferred-height` 排行高的,而那个高度是在**宽度还没定下来**
+            // 的时候算的 —— 换行的单元格会按「一行」的高度排,第二行字直接压到下一行上
+            // (实测)。所以:单元格高度 = 文字按列宽换行后的高 + 上下内边距。
             for cell in block.cells : Rectangle {
                 row: cell.row;
                 col: cell.col;   // 注意是 col 不是 column(Slint 的 GridLayout 用 col)
+                width: root.table-cell-w;
+                height: cell-text.preferred-height + 12px;
                 background: cell.header ? Theme.accent-soft : transparent;
 
-                // padding 只能加在布局元素上(直接写给 Text 会被警告且无效),所以套一层
-                HorizontalLayout {
-                    padding: 6px;
-                    Text {
-                        text: cell.text;
-                        font-size: 12px;
-                        font-weight: cell.header ? 600 : 400;
-                        color: Theme.text;
-                        vertical-alignment: center;
+                // padding 只能加在布局元素上(直接写给 Text 会被警告且无效),
+                // 这里干脆用显式 x/y —— 也得显式给宽度,`preferred-height` 才会按它换行
+                cell-text := Text {
+                    x: 6px;
+                    y: 6px;
+                    width: root.table-cell-w - 12px;
+                    height: self.preferred-height;
+                    text: cell.text;
+                    font-size: 12px;
+                    font-weight: cell.header ? 600 : 400;
+                    color: Theme.text;
+                    // 长内容折行(列宽是确定的,见上面 table-cell-w)
+                    wrap: word-wrap;
+                    // 对齐来自分隔行的冒号(`:---` / `:---:` / `---:`)
+                    horizontal-alignment: cell.align == 1 ? center
+                        : cell.align == 2 ? right : left;
+                }
+            }
+        }
+    }
+
+    // ── 图片 ──
+    //
+    // **尺寸是 Rust 算好的**(等比缩进上限之内,见 main.rs 的 IMAGE_MAX_*),
+    // 这里只负责摆 —— 几何在宿主管,是这个项目一直的规矩。
+    //
+    // 解码失败(路径写错、格式不认)时画一个占位框:把 alt 和失败原因摆出来,
+    // 比空白强,也比把 `![说明](路径)` 原文露出来强(照 GitHub 破图的样子)。
+    image-box := Rectangle {
+        visible: block.kind == MdKind.image;
+        x: 0;
+        y: 5px;
+        // 成功时就是图自己的显示尺寸(比栏窄就左对齐);失败时占满整宽
+        width: block.image-ok ? root.image-w : parent.width;
+        height: block.image-ok ? root.image-h : broken-col.preferred-height + 22px;
+        background: transparent;
+
+        image-el := Image {
+            visible: block.image-ok;
+            source: block.image;
+            width: parent.width;
+            height: parent.height;
+            image-fit: contain;
+        }
+
+        // 只看原图:点一下通知外层开浮层(笔记窗口接)
+        TouchArea {
+            visible: block.image-ok;
+            mouse-cursor: pointer;
+            clicked => {
+                root.image-clicked(
+                    block.image,
+                    block.image-label,
+                    block.image-natural-width,
+                    block.image-natural-height,
+                );
+            }
+        }
+
+        // ── 破图占位 ──
+        broken-box := Rectangle {
+            visible: !block.image-ok;
+            width: parent.width;
+            height: parent.height;
+            border-radius: 8px * Theme.radius-scale;
+            background: Theme.inset;
+            border-width: 1px;
+            border-color: Theme.danger;
+            // ⚠️ Slint 的 Rectangle **没有虚线边**(只有宽度/颜色),所以这里用
+            // 实线 + 一个「图」的提示撑住语义,别指望画得出虚线
+
+            broken-col := VerticalLayout {
+                x: 10px;
+                y: 10px;
+                width: parent.width - 20px;
+                spacing: 4px;
+
+                Text {
+                    text: "🖼 " + block.image-label;
+                    color: Theme.text;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: block.image-detail;
+                    color: Theme.text-dim;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // ── 任务列表 ──
+    //
+    // 勾选框**真的能点**:点了把源码那一行改掉(宿主负责),不是只改显示 ——
+    // 所以这里只转发行号(`item.line`),别的什么都不做。
+    tasks-box := Rectangle {
+        visible: block.kind == MdKind.tasks;
+        width: parent.width;
+        x: 0;
+        y: 5px;
+        height: tasks-col.preferred-height + 12px;
+        background: transparent;
+
+        tasks-col := VerticalLayout {
+            x: 2px;
+            y: 6px;
+            width: parent.width - 4px;
+            spacing: 4px;
+
+            for item in block.tasks : HorizontalLayout {
+                spacing: 6px;
+
+                VCenter {
+                    TodoCheck {
+                        checked: item.done;
+                        toggled => { root.task-toggled(item.line); }
                     }
+                }
+
+                task-text := StyledText {
+                    text: item.text;
+                    // 文字右边界:整宽减去勾选框(22px)和间距
+                    width: parent.width - 28px;
+                    height: self.preferred-height;
+                    // ⚠️ StyledText 没有 `font-size`,只有 `default-font-size` 这一组 default-*
+                    default-font-size: 13px;
+                    // 勾掉的用暗色(删除线在 StyledText 里是支持的,但那得**改文本内容** ——
+                    // 我们不想动用户写的字,所以只用颜色区分)
+                    default-color: item.done ? Theme.text-dim : Theme.text;
+                    link-color: Theme.accent-ink;
                 }
             }
         }

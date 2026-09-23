@@ -10,7 +10,8 @@ import {
 import {
     AppData, Backdrop, Filter, PanelEdge, Logic, RemindOptions, Theme, TimeBadge, TimeOption,
     TodoCheck, TodoItem, View,
-    Chip, FilterTab, IconButton, PrimaryButton, TextButton, Toggle, VCenter, WindowButton,
+    Chip, ClipTextInput, FilterTab, IconButton, PrimaryButton, TextButton, Toggle, VCenter,
+    WindowButton,
 } from "widgets.slint";
 import { CalendarView } from "calendar.slint";
 import { WeekView } from "week.slint";
@@ -105,7 +106,7 @@ component TodoRow inherits Rectangle {
                 padding-left: 8px;
                 padding-right: 8px;
 
-                edit-field := TextInput {
+                edit-field := ClipTextInput {
                     text <=> AppData.edit-text;
                     color: Theme.text;
                     font-size: 14px;
@@ -114,14 +115,14 @@ component TodoRow inherits Rectangle {
                     horizontal-stretch: 1;
                     init => { self.focus(); }
                     accepted => { root.committed(AppData.edit-text); }
-                    // 只接管 Esc;其余按键必须 reject,否则 TextInput 内置的
-                    // 编辑逻辑不会执行(字打不进去)。
-                    key-pressed(ev) => {
+                    // 只接管 Esc;其余一律 false,交给 ClipTextInput 放行 ——
+                    // 不然 TextInput 内置的编辑逻辑不会执行(字打不进去)
+                    extra-key(ev) => {
                         if (ev.text == Key.Escape) {
                             root.cancelled();
-                            accept
+                            true
                         } else {
-                            reject
+                            false
                         }
                     }
                 }
@@ -452,7 +453,7 @@ export component AppWindow inherits Window {
                 padding-right: 7px;
                 spacing: 8px;
 
-                input := TextInput {
+                input := ClipTextInput {
                     text <=> AppData.draft;
                     color: Theme.text;
                     font-size: 14px;

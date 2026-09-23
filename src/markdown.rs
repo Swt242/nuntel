@@ -6,8 +6,15 @@
 //! 但它**不支持标题、代码块、引用、表格、分隔线**(见 Slint 文档的 StyledText 页)。
 //!
 //! 所以这里的分工是:
-//! - **这里**:把源码切成「段落 / 标题 / 代码块 / 引用 / 分隔线 / 表格」这些块;
+//! - **这里**:把源码切成「段落 / 标题 / 代码块 / 引用 / 分隔线 / 表格 / 图片 / 任务列表」
+//!   这些块;
 //! - **StyledText**:负责块**内部**的行内样式。
+//!
+//! 两个**它渲染不了、只能在这里降级**的东西:
+//! - **行内图片**(夹在句子中间的 `![alt](路径)`):Slint 没法把图塞进文字流,降级成 alt 文字;
+//! - 单独成行的图片才出一个 `Image` 块,交给 UI 画。
+//!
+//! 任务列表要**带源码行号**,因为预览里点勾选框是**回去改源码**(不是只改显示)。
 //!
 //! 这样既不用引 pulldown-cmark(块级那点规则自己切足够),也不用自己写行内解析器。
 //!
@@ -29,7 +36,35 @@ pub enum Block {
     Rule,
     /// 表格。**每个元素是一行,行里是各单元格** —— 在 Rust 侧就切好,
     /// UI 才能用 GridLayout 画出真正对齐的表格(StyledText 不支持表格)。
-    Table(Vec<Vec<String>>),
+    /// `aligns` 是每列的对齐,来自分隔行里的冒号(`:---` / `:---:` / `---:`),
+    /// 长度一定等于列数(列数对不上就当不成表格,见 `table_sep_aligns`)。
+    Table { rows: Vec<Vec<String>>, aligns: Vec<Align> },
+    /// 单独成行的图片:`![alt](路径)`(可选的 `"标题"` 认了但不用)。
+    ///
+    /// ⚠️ **只有「整行就是一张图」才出这个块**。夹在句子中间的行内图片**渲染不了**
+    /// (Slint 没法把图塞进文字流里),那边降级成 alt 文字,见 `strip_inline_images`。
+    Image { alt: String, url: String },
+    /// 任务列表:`- [ ]` / `- [x]`,连续成组的行合成一块。
+    ///
+    /// 每项带着**源码行号** —— 预览里点勾选框要照着它回去改源码(不是只改显示)。
+    Tasks(Vec<TaskItem>),
+}
+
+/// 表格某一列的对齐方式(分隔行里冒号的位置决定)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// 任务列表里的一项
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskItem {
+    pub done: bool,
+    pub text: String,
+    /// 这一项在**源码里的行号**(0 起)。回写「勾上/取消」要用它定位。
+    pub line: usize,
 }
 
 /// 把 Markdown 源码切成块。
@@ -46,7 +81,7 @@ pub fn parse(src: &str) -> Vec<Block> {
     macro_rules! flush_para {
         () => {
             if !para.is_empty() {
-                blocks.push(Block::Rich(para.join("\n")));
+                blocks.push(Block::Rich(strip_inline_images(&para.join("\n"))));
                 para.clear();
             }
         };
@@ -104,7 +139,7 @@ pub fn parse(src: &str) -> Vec<Block> {
         // 标题 # .. ######
         if let Some((level, text)) = heading(trimmed) {
             flush_para!();
-            blocks.push(Block::Heading { level, text });
+            blocks.push(Block::Heading { level, text: strip_inline_images(&text) });
             i += 1;
             continue;
         }
@@ -123,7 +158,30 @@ pub fn parse(src: &str) -> Vec<Block> {
                     break;
                 }
             }
-            blocks.push(Block::Quote(quoted.join("\n").trim().to_string()));
+            let text = strip_inline_images(quoted.join("\n").trim());
+            blocks.push(Block::Quote(text));
+            continue;
+        }
+
+        // 单独成行的图片(排在表格前面:`![a](b)` 里不会有竖线,顺序其实无所谓,
+        // 但任务列表那一支必须排在表格前面 —— `- [x] 甲 | 乙` 得算任务不算表格)
+        if let Some((alt, url)) = image_line(trimmed) {
+            flush_para!();
+            blocks.push(Block::Image { alt, url });
+            i += 1;
+            continue;
+        }
+
+        // 任务列表:连续成组的 `- [ ]` / `- [x]` 合成一块(中间夹了别的行就断开)
+        if task_line(trimmed).is_some() {
+            flush_para!();
+            let mut items = Vec::new();
+            while i < lines.len() {
+                let Some((done, text)) = task_line(lines[i].trim()) else { break };
+                items.push(TaskItem { done, text: strip_inline_images(&text), line: i });
+                i += 1;
+            }
+            blocks.push(Block::Tasks(items));
             continue;
         }
 
@@ -134,10 +192,12 @@ pub fn parse(src: &str) -> Vec<Block> {
         // - 要求列数一致,是为了别把「一行带竖线的普通文字 + 下一行是 ---」误判成表格
         //   (分隔行的 `---` 本身也是「一格全横线」,不比对列数就会误判);
         // - 后面的数据行同理,必须带竖线才收。
-        if trimmed.contains('|')
-            && i + 1 < lines.len()
-            && is_table_sep(lines[i + 1].trim(), split_row(trimmed).len())
-        {
+        let table_aligns = if trimmed.contains('|') && i + 1 < lines.len() {
+            table_sep_aligns(lines[i + 1].trim(), split_row(trimmed).len())
+        } else {
+            None
+        };
+        if let Some(mut aligns) = table_aligns {
             flush_para!();
             let mut rows: Vec<Vec<String>> = vec![split_row(lines[i])];
             i += 2; // 跳过表头行和分隔行
@@ -149,8 +209,15 @@ pub fn parse(src: &str) -> Vec<Block> {
             let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
             for row in rows.iter_mut() {
                 row.resize(cols, String::new());
+                // 单元格是纯文本(不走 StyledText),行内图片在这里降级成 alt
+                for cell in row.iter_mut() {
+                    *cell = strip_inline_images(cell);
+                }
             }
-            blocks.push(Block::Table(rows));
+            // 分隔行少写几格时(行本身合法但列数不同)会被 `table_sep_aligns` 挡掉,
+            // 走到这儿 aligns 一定够长;补齐只是防手滑
+            aligns.resize(cols, Align::Left);
+            blocks.push(Block::Table { rows, aligns });
             continue;
         }
 
@@ -217,19 +284,148 @@ fn split_row(line: &str) -> Vec<String> {
     inner.split('|').map(|c| c.trim().to_string()).collect()
 }
 
-/// 表格的分隔行:`|---|---|` 或 `|:--:|` 这种(首尾竖线可有可无)。
+/// 表格的分隔行:`|---|---|` 或 `|:--:|` 这种(首尾竖线可有可无),
+/// 顺带把**每列的对齐**解析出来。返回 `None` = 不是合法分隔行,或者列数跟表头对不上。
 ///
 /// `expect_cols` 是表头那行的列数:必须**对得上**才算表格 ——
 /// 否则「一段带竖线的普通文字」后面跟一行 `---`(分隔线)也会被认成表格。
-fn is_table_sep(trimmed: &str, expect_cols: usize) -> bool {
+fn table_sep_aligns(trimmed: &str, expect_cols: usize) -> Option<Vec<Align>> {
     let cells = split_row(trimmed);
     if cells.is_empty() || cells.len() != expect_cols {
-        return false;
+        return None;
     }
-    cells.iter().all(|c| {
-        let c = c.trim().trim_matches(':');
-        !c.is_empty() && c.chars().all(|ch| ch == '-')
-    })
+    let mut aligns = Vec::with_capacity(cells.len());
+    for cell in &cells {
+        let cell = cell.trim();
+        let dashes = cell.trim_matches(':');
+        if dashes.is_empty() || !dashes.chars().all(|ch| ch == '-') {
+            return None;
+        }
+        // 两头的冒号决定对齐:`:---:` 居中、`---:` 靠右、其余(含 `:---`)靠左
+        aligns.push(match (cell.starts_with(':'), cell.ends_with(':')) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        });
+    }
+    Some(aligns)
+}
+
+/// 整行就是一张图片:`![alt](路径)`,后面可以再跟一个 `"标题"`(认了,但不用)。
+///
+/// **只有整行才算** —— 前后还有别的字就是行内图片,那条路走 `strip_inline_images`。
+fn image_line(trimmed: &str) -> Option<(String, String)> {
+    let rest = trimmed.strip_prefix("![")?;
+    let (alt, rest) = rest.split_once("](")?;
+    let rest = rest.strip_suffix(')')?;
+    // 路径取第一个空白之前那一段,空白后面是可选标题
+    let url = rest.split_whitespace().next().unwrap_or("");
+    if url.is_empty() {
+        return None;
+    }
+    Some((alt.to_string(), url.to_string()))
+}
+
+/// 任务列表的一行:`- [ ] 文字` / `- [x] 文字`(也认 `*` `+` 和大写 `X`)。
+/// 返回 `(勾没勾, 后面的文字)`。
+fn task_line(trimmed: &str) -> Option<(bool, String)> {
+    let rest = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))?;
+    let rest = rest.strip_prefix('[')?;
+    let mut chars = rest.chars();
+    let done = match chars.next()? {
+        ' ' => false,
+        'x' | 'X' => true,
+        _ => return None,
+    };
+    let rest = chars.as_str().strip_prefix(']')?;
+    // `]` 后面必须是空格或者行尾,免得把 `[x]y` 这种也算成任务
+    if !rest.is_empty() && !rest.starts_with(' ') {
+        return None;
+    }
+    Some((done, rest.trim_start().to_string()))
+}
+
+/// 任务行里那个**标记字符**(`[ ]` 的空格、或 `[x]` 的 x)在整行里的字节位置。
+///
+/// 认缩进、认 `-`/`*`/`+`;别的一律 `None`。
+fn task_mark_offset(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    // 先跳过行首空白(缩进的子任务也要能点)
+    let mut i = line.len() - line.trim_start().len();
+    match *bytes.get(i)? {
+        b'-' | b'*' | b'+' => i += 1,
+        _ => return None,
+    }
+    while bytes.get(i) == Some(&b' ') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'[') {
+        return None;
+    }
+    i += 1;
+    match *bytes.get(i)? {
+        b' ' | b'x' | b'X' => Some(i),
+        _ => None,
+    }
+}
+
+/// 把**某一行**任务勾选框翻过来(`[ ]` ↔ `[x]`),返回改过的新源码。
+///
+/// 行号越界、或者那一行已经不是任务了,返回 `None` —— 预览里点一下的时候,
+/// 用户可能正在编辑器里改这一行,这种「对不上」的情况什么都不做最安全。
+///
+/// 只动方括号里那**一个字符**:整行的缩进、空格、后面的正文一个字节都不碰
+/// (源码是用户的,别顺手规范化)。
+pub fn toggle_task_line(src: &str, line: usize) -> Option<String> {
+    let mut out = String::with_capacity(src.len() + 1);
+    let mut hit = false;
+    for (i, text) in src.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if i != line {
+            out.push_str(text);
+            continue;
+        }
+        let at = task_mark_offset(text)?;
+        let mark = if text.as_bytes()[at] == b' ' { 'x' } else { ' ' };
+        out.push_str(&text[..at]);
+        out.push(mark);
+        out.push_str(&text[at + 1..]);
+        hit = true;
+    }
+    hit.then_some(out)
+}
+
+/// 把**行内**图片 `![alt](路径)` 降级成 `alt`。
+///
+/// 为什么非降级不可:行内样式是交给 Slint 的 `StyledText` 的,而它**不认图片**,
+/// 不处理的话页面上会直接露出一串 `![说明](路径)` 原文 —— 比没有图更难看。
+/// 渲染不了图,至少把说明文字留给人看(和 GitHub 图片挂了显示 alt 是一个意思)。
+///
+/// 只认最简单的一层,不做嵌套括号。**输入不完整时原样保留**(AI 流式回复经常只有
+/// 半截 `![`),等下一轮解析出完整的再降级。
+fn strip_inline_images(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("![") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some((alt, tail)) = after.split_once("](") {
+            if let Some(end) = tail.find(')') {
+                out.push_str(alt);
+                rest = &tail[end + 1..];
+                continue;
+            }
+        }
+        out.push_str("![");
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -327,7 +523,7 @@ mod tests {
         let blocks = parse(src);
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
-            Block::Table(rows) => {
+            Block::Table { rows, .. } => {
                 assert_eq!(rows.len(), 3, "表头 + 两行数据:{rows:?}");
                 assert_eq!(rows[0], vec!["列 A", "列 B"]);
                 assert_eq!(rows[2], vec!["3", "4"]);
@@ -343,7 +539,7 @@ mod tests {
     fn pads_short_table_rows() {
         let src = "| A | B | C |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 |";
         match &parse(src)[0] {
-            Block::Table(rows) => {
+            Block::Table { rows, .. } => {
                 assert_eq!(rows[1], vec!["1", "", ""]);
                 assert_eq!(rows[2], vec!["1", "2", "3"]);
             }
@@ -356,7 +552,7 @@ mod tests {
     fn table_without_outer_pipes() {
         let src = "A | B\n---|---\n1 | 2";
         match &parse(src)[0] {
-            Block::Table(rows) => {
+            Block::Table { rows, .. } => {
                 assert_eq!(rows[0], vec!["A", "B"]);
                 assert_eq!(rows[1], vec!["1", "2"]);
             }
@@ -401,6 +597,131 @@ mod tests {
         assert!(matches!(blocks[3], Block::Code { .. }));
         assert!(matches!(blocks[4], Block::Rule));
         assert!(matches!(blocks[5], Block::Rich(_)));
+    }
+
+    /// 整行一张图 = 一个图片块(可选的 "标题" 认了但不影响 url)
+    #[test]
+    fn image_alone_on_a_line_becomes_a_block() {
+        assert_eq!(
+            parse("![示意图](pics/a.png)"),
+            vec![Block::Image { alt: "示意图".into(), url: "pics/a.png".into() }]
+        );
+        // 前后有空白没事
+        assert_eq!(
+            parse("   ![图](b.jpg)  "),
+            vec![Block::Image { alt: "图".into(), url: "b.jpg".into() }]
+        );
+        // 带标题的写法
+        assert_eq!(
+            parse("![图](c.png \"标题\")"),
+            vec![Block::Image { alt: "图".into(), url: "c.png".into() }]
+        );
+        // 路径是空的:不当图片,退回普通段落(宁可显示原文也别画个空框)
+        assert!(matches!(parse("![]()")[0], Block::Rich(_)));
+    }
+
+    /// 夹在句子里的行内图片渲染不了,降级成 alt 文字 ——
+    /// 关键是**别把 `![说明](路径)` 原文露给用户**
+    #[test]
+    fn inline_image_falls_back_to_alt_text() {
+        assert_eq!(
+            parse("看这张 ![示意图](a.png) 就懂了"),
+            vec![Block::Rich("看这张 示意图 就懂了".into())]
+        );
+        // 引用和标题里也一样
+        assert_eq!(parse("> 见图 ![图](b.png)"), vec![Block::Quote("见图 图".into())]);
+        assert_eq!(
+            parse("# 标题 ![图](c.png)"),
+            vec![Block::Heading { level: 1, text: "标题 图".into() }]
+        );
+    }
+
+    /// 流式回复里经常只有半截 `![`,这时候原样留着,等下一轮再降级
+    #[test]
+    fn unfinished_inline_image_is_left_alone() {
+        assert_eq!(parse("见图 ![图](a.p"), vec![Block::Rich("见图 ![图](a.p".into())]);
+        assert_eq!(parse("见图 !["), vec![Block::Rich("见图 ![".into())]);
+    }
+
+    /// 任务列表合成一块,并且**带源码行号**(预览里点勾选框靠它回写源码)
+    #[test]
+    fn task_list_carries_source_line_numbers() {
+        // 行号:0 开头 / 1 空行 / 2..4 三行任务 / 5 空行 / 6 结尾
+        let blocks = parse("开头\n\n- [ ] 甲\n- [x] 乙\n* [X] 丙\n\n结尾");
+        assert_eq!(blocks.len(), 3, "{blocks:#?}");
+        match &blocks[1] {
+            Block::Tasks(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!((items[0].done, items[0].text.as_str(), items[0].line), (false, "甲", 2));
+                assert_eq!((items[1].done, items[1].text.as_str(), items[1].line), (true, "乙", 3));
+                assert_eq!((items[2].done, items[2].text.as_str(), items[2].line), (true, "丙", 4));
+            }
+            other => panic!("不是任务列表: {other:?}"),
+        }
+    }
+
+    /// `[x]` 后面没空格、或者方括号里是别的东西 —— 都不算任务
+    #[test]
+    fn task_list_needs_the_exact_shape() {
+        assert_eq!(parse("- [x]紧挨着"), vec![Block::Rich("- [x]紧挨着".into())]);
+        assert_eq!(parse("- [-] 没有这种"), vec![Block::Rich("- [-] 没有这种".into())]);
+        assert_eq!(parse("- [ ]"), vec![Block::Tasks(vec![TaskItem {
+            done: false,
+            text: String::new(),
+            line: 0,
+        }])]);
+    }
+
+    /// 真实笔记里那种表格(前面有小标题、后面跟空行、带对齐冒号、有长单元格)
+    /// —— 从验收笔记里原样抄下来的回归用例
+    #[test]
+    fn recognises_table_from_a_real_note() {
+        let src = "## 表格\n\n| 左对齐 | 居中 | 右对齐 |\n|:---|:---:|---:|\n| 短 | 中间 | 1 |\n| 长文本长文本 | 中 | 2 |\n\n## 任务列表\n";
+        let blocks = parse(src);
+        // 标题 + 表格 + 标题 = 3 块(别把「## 任务列表」那次数漏)
+        assert_eq!(blocks.len(), 3, "{blocks:#?}");
+        assert!(matches!(blocks[1], Block::Table { .. }), "{blocks:#?}");
+    }
+
+    /// 翻勾选框:只动方括号里那一个字符,缩进和正文一个字节都不碰
+    #[test]
+    fn toggle_task_line_flips_only_the_mark() {
+        let src = "标题\n\n- [ ] 甲\n  - [x] 乙\n* [X] 丙\n";
+        assert_eq!(
+            toggle_task_line(src, 2).unwrap(),
+            "标题\n\n- [x] 甲\n  - [x] 乙\n* [X] 丙\n"
+        );
+        assert_eq!(
+            toggle_task_line(src, 3).unwrap(),
+            "标题\n\n- [ ] 甲\n  - [ ] 乙\n* [X] 丙\n"
+        );
+        assert_eq!(
+            toggle_task_line(src, 4).unwrap(),
+            "标题\n\n- [ ] 甲\n  - [x] 乙\n* [ ] 丙\n"
+        );
+        // 行号越界、不是任务行、不是列表行 —— 都原样不动(返回 None 让调用方别理它)
+        assert_eq!(toggle_task_line(src, 99), None);
+        assert_eq!(toggle_task_line(src, 0), None);
+        assert_eq!(toggle_task_line("普通段落", 0), None);
+        assert_eq!(toggle_task_line("- [-] 没有这种", 0), None);
+    }
+
+    /// 分隔行两头的冒号决定对齐:`:---` 左、`:---:` 中、`---:` 右
+    #[test]
+    fn table_alignment_comes_from_the_separator() {
+        let src = "| 左 | 中 | 右 |\n|:---|:---:|---:|\n| 1 | 2 | 3 |";
+        match &parse(src)[0] {
+            Block::Table { aligns, rows } => {
+                assert_eq!(aligns, &vec![Align::Left, Align::Center, Align::Right]);
+                assert_eq!(rows.len(), 2);
+            }
+            other => panic!("不是表格: {other:?}"),
+        }
+        // 没写冒号就是左对齐(和 GitHub 一致)
+        match &parse("A|B\n---|---\n1|2")[0] {
+            Block::Table { aligns, .. } => assert_eq!(aligns, &vec![Align::Left, Align::Left]),
+            other => panic!("不是表格: {other:?}"),
+        }
     }
 
     #[test]

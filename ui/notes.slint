@@ -14,8 +14,8 @@
 import { ScrollView } from "std-widgets.slint";
 import { MdBlockView } from "markdown.slint";
 import {
-    AppData, Backdrop, FilterTab, IconButton, Logic, MdKind, MdView, PanelEdge, Theme,
-    TextButton, VCenter, WindowButton,
+    AppData, Backdrop, ClipTextInput, FilterTab, IconButton, Logic, MdKind, MdView, PanelEdge,
+    Theme, TextButton, VCenter, WindowButton,
 } from "widgets.slint";
 
 /// 笔记列表里的一行。
@@ -61,7 +61,7 @@ component NoteRow inherits Rectangle {
         padding-right: 2px;
         spacing: 4px;
 
-        if root.renaming : TextInput {
+        if root.renaming : ClipTextInput {
             text <=> root.draft;
             color: Theme.text;
             font-size: 12px;
@@ -70,14 +70,14 @@ component NoteRow inherits Rectangle {
             horizontal-stretch: 1;
             init => { self.focus(); }
             accepted => { root.renaming = false; root.committed(root.draft); }
-            // 只接管 Esc;其余按键必须 reject,否则 TextInput 内置的编辑逻辑
-            // 不会执行(字打不进去)
-            key-pressed(ev) => {
+            // 只接管 Esc;其余一律 false,交给 ClipTextInput 放行 ——
+            // 不然 TextInput 内置的编辑逻辑不会执行(字打不进去)
+            extra-key(ev) => {
                 if (ev.text == Key.Escape) {
                     root.renaming = false;
-                    accept
+                    true
                 } else {
-                    reject
+                    false
                 }
             }
         }
@@ -147,6 +147,22 @@ export component NotesWindow inherits Window {
         AppData.md-view == MdView.split ? self.area-w / 2
         : (AppData.md-view == MdView.edit ? self.area-w : 0px);
     private property <length> prev-w: self.area-w - self.src-w;
+
+    // ── 「看原图」浮层 ──
+    //
+    // 预览里点图片开它。图**按原始像素画**:比窗口大就缩到窗口内(留 40px 边),
+    // 比窗口小就原样 —— 「看原图」的意思就是不放大、不压缩。
+    private property <bool> zoom-open: false;
+    private property <image> zoom-image;
+    private property <string> zoom-label;
+    private property <length> zoom-w: 0px;
+    private property <length> zoom-h: 0px;
+
+    /// 关掉浮层,并把焦点还给编辑器 —— 不还的话关掉之后字打不进去
+    function close-zoom() {
+        zoom-open = false;
+        md-input.focus();
+    }
 
     Backdrop {
         x: 0;
@@ -335,7 +351,7 @@ export component NotesWindow inherits Window {
         border-width: 1px;
         border-color: Theme.border;
 
-        md-input := TextInput {
+        md-input := ClipTextInput {
             text <=> AppData.md-source;
             width: parent.width - 20px;
             height: parent.height - 16px;
@@ -349,13 +365,14 @@ export component NotesWindow inherits Window {
             wrap: word-wrap;
             init => { self.focus(); }
 
-            // Ctrl+S 保存;只接管这一个,其余按键必须 reject(不然编辑键/输入法会被吃)
-            key-pressed(ev) => {
+            // Ctrl+S 保存;只接管这一个,其余一律 false 交给 ClipTextInput 放行
+            // (不然编辑键/输入法/Shift+Insert 会被吃)
+            extra-key(ev) => {
                 if (ev.modifiers.control && (ev.text == "s" || ev.text == "S")) {
                     Logic.md-save();
-                    accept
+                    true
                 } else {
-                    reject
+                    false
                 }
             }
         }
@@ -417,6 +434,14 @@ export component NotesWindow inherits Window {
             for b in AppData.md-blocks : MdBlockView {
                 block: b;
                 horizontal-stretch: 1;
+                image-clicked(img, label, w, h) => {
+                    root.zoom-image = img;
+                    root.zoom-label = label;
+                    root.zoom-w = w;
+                    root.zoom-h = h;
+                    root.zoom-open = true;
+                }
+                task-toggled(line) => { Logic.md-toggle-task(line); }
             }
         }
     }
@@ -454,6 +479,63 @@ export component NotesWindow inherits Window {
                 color: Theme.accent-ink;
                 vertical-alignment: center;
             }
+        }
+    }
+
+    // ── 「看原图」浮层(预览里点图片开)──
+    //
+    // ⚠️ 两处别改回去:
+    // 1. **几何用 `root.` 而不是 `parent.`** —— 条件元素(`if ... :`)会插一层隐式父级,
+    //    里面的 `parent` 不一定还是窗口(这个坑在 widgets.slint 的 FilterTab 上踩过)。
+    // 2. **用 FocusScope 而不是普通元素** —— 只有能拿焦点的元素才收得到 Esc。
+    //    浮层开的时候把焦点抢过来,关掉时由 `close-zoom()` 还给编辑器。
+    //
+    // 灯箱式的暗底和主题无关(#000000c0):三套外观下都是「把注意力压到图上」。
+    if root.zoom-open : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000c0;
+
+        // 点任意处关掉(图自己不吃点击,所以在图上点也是关 —— 和常见看图器一致)
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.close-zoom(); }
+        }
+
+        Image {
+            source: root.zoom-image;
+            // 比窗口大就缩到窗口内(留 40px 边),比窗口小就按**原始像素**画
+            width: min(root.zoom-w, root.width - 40px);
+            height: min(root.zoom-h, root.height - 40px);
+            x: (root.width - self.width) / 2;
+            y: (root.height - self.height) / 2;
+            image-fit: contain;
+        }
+
+        zoom-focus := FocusScope {
+            width: parent.width;
+            height: parent.height;
+            init => { self.focus(); }
+            key-pressed(ev) => {
+                if (ev.text == Key.Escape) {
+                    root.close-zoom();
+                    accept
+                } else {
+                    reject
+                }
+            }
+        }
+
+        Text {
+            text: root.zoom-label + " · Esc 或点任意处关闭";
+            color: #ffffffd0;
+            font-size: 12px;
+            horizontal-alignment: center;
+            x: 0;
+            y: root.height - 26px;
+            width: root.width;
         }
     }
 }

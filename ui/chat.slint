@@ -16,8 +16,8 @@
 import { ScrollView } from "std-widgets.slint";
 import { MdBlockView } from "markdown.slint";
 import {
-    AppData, Backdrop, ChatMsg, ChatWho, IconButton, Logic, MdKind, PanelEdge, Theme,
-    TextButton, VCenter, WindowButton,
+    AppData, Backdrop, ChatMsg, ChatWho, ClipTextInput, IconButton, Logic, MdKind, PanelEdge,
+    Theme, TextButton, VCenter, WindowButton,
 } from "widgets.slint";
 
 /// 一条消息。气泡宽度跟着文字走,但不超过行宽的 82%。
@@ -87,7 +87,7 @@ component Field inherits Rectangle {
         // 聚焦时描一圈强调色,不然在一堆同色输入框里看不出光标在哪
         border-color: input.has-focus ? Theme.accent-ink : Theme.border;
 
-        input := TextInput {
+        input := ClipTextInput {
             text <=> root.text;
             single-line: true;
             font-size: 12px;
@@ -409,7 +409,7 @@ export component ChatWindow inherits Window {
                 border-width: 1px;
                 border-color: chat-input.has-focus ? Theme.accent-ink : Theme.border;
 
-                chat-input := TextInput {
+                chat-input := ClipTextInput {
                     text <=> AppData.chat-draft;
                     single-line: true;
                     font-size: 13px;
@@ -428,13 +428,14 @@ export component ChatWindow inherits Window {
                             Logic.chat-send(AppData.chat-draft);
                         }
                     }
-                    // 只接管 Esc;其余按键必须 reject,否则输入法/编辑键会被吃掉
-                    key-pressed(ev) => {
+                    // 只接管 Esc;其余一律 false,交给 ClipTextInput 放行 ——
+                    // 不然输入法/编辑键/Shift+Insert 都会被吃掉
+                    extra-key(ev) => {
                         if (ev.text == Key.Escape) {
                             Logic.chat-close();
-                            accept
+                            true
                         } else {
-                            reject
+                            false
                         }
                     }
                 }

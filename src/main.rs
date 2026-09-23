@@ -22,10 +22,11 @@ mod platform;
 mod reminder;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{Datelike, Local, NaiveDate, NaiveTime, Timelike};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
@@ -507,6 +508,9 @@ struct State {
     notes_blocks: Rc<VecModel<MdBlock>>,
     /// 上一次切块时的源码,用来判断「要不要重新解析」
     notes_last_source: RefCell<String>,
+    /// 解码好的图片。键是 **(绝对路径, 文件修改时间)** —— 带时间是故意的:
+    /// 换了图不用重启就能看到新的。见 `State::image_slot`。
+    image_cache: RefCell<HashMap<(PathBuf, Option<SystemTime>), ImageSlot>>,
     notes_tick: Cell<i32>,
     /// 预览的刷新定时器(只在窗口可见时跑)
     notes_timer: RefCell<Option<Timer>>,
@@ -1724,7 +1728,11 @@ impl State {
         }
         *self.notes_last_source.borrow_mut() = source.clone();
 
-        let blocks: Vec<MdBlock> = markdown::parse(&source).into_iter().map(to_ui_block).collect();
+        let base = self.note_base_dir(&self.notes_current.borrow());
+        let blocks: Vec<MdBlock> = markdown::parse(&source)
+            .into_iter()
+            .map(|b| self.to_ui_block(b, base.as_deref()))
+            .collect();
         self.notes_blocks.set_vec(blocks);
 
         let app = notes.global::<AppData>();
@@ -1786,12 +1794,47 @@ impl State {
             .unwrap_or_else(|| self.notes_dir.display().to_string())
     }
 
+    /// 某一篇笔记**所在的目录** —— 正文里 `![](相对路径)` 的基准。
+    ///
+    /// ⚠️ 参数是**篇名**,不是「当前篇」:`load_note` 是先把内容切块、后面才更新
+    /// `notes_current` 的,从 self 上读会拿到上一篇的目录。
+    fn note_base_dir(&self, name: &str) -> Option<PathBuf> {
+        if name.is_empty() {
+            return None;
+        }
+        notes::path_in(&self.notes_dir, name).and_then(|p| p.parent().map(Path::to_path_buf))
+    }
+
+    /// 预览里点了任务勾选框:把源码那一行的 `[ ]`/`[x]` 翻过来。
+    ///
+    /// **改的是源码**(推回 `md-source`),不是只改显示 —— 编辑器里、存到盘上都跟着变。
+    /// 下一拍 `push_notes_blocks` 发现源码变了会重新切块,勾选框自己就更新了。
+    fn toggle_note_task(&self, line: i32) {
+        if line < 0 {
+            return;
+        }
+        let Some(notes) = self.notes.borrow().as_ref().cloned() else { return };
+        let app = notes.global::<AppData>();
+        let source = app.get_md_source().to_string();
+        // 行号越界、或者那行已经不是任务了(用户刚在编辑器里改过)—— 什么都不做,
+        // 下一拍重新切块时界面会对齐
+        let Some(flipped) = markdown::toggle_task_line(&source, line as usize) else { return };
+        app.set_md_source(flipped.as_str().into());
+        self.set_notes_dirty(true);
+    }
+
     /// 把一篇笔记的内容灌进界面(不负责保存上一篇 —— 调用方先 `save_notes`)。
     fn load_note(&self, name: &str) {
         let Some(notes) = self.notes.borrow().as_ref().cloned() else { return };
         let text = notes::read(&self.notes_dir, name);
         *self.notes_last_source.borrow_mut() = text.clone();
-        let blocks: Vec<MdBlock> = markdown::parse(&text).into_iter().map(to_ui_block).collect();
+        // ⚠️ 基准目录要用**参数里的 name**:下面几行才把 notes_current 改成这一篇,
+        // 从 self 上读会拿到上一篇的目录
+        let base = self.note_base_dir(name);
+        let blocks: Vec<MdBlock> = markdown::parse(&text)
+            .into_iter()
+            .map(|b| self.to_ui_block(b, base.as_deref()))
+            .collect();
         self.notes_blocks.set_vec(blocks);
 
         *self.notes_current.borrow_mut() = name.to_string();
@@ -2039,8 +2082,11 @@ impl State {
         {
             let app = notes.global::<AppData>();
             app.set_md_source(body.as_str().into());
-            let blocks: Vec<MdBlock> =
-                markdown::parse(&body).into_iter().map(to_ui_block).collect();
+            let base = self.note_base_dir(&target);
+            let blocks: Vec<MdBlock> = markdown::parse(&body)
+                .into_iter()
+                .map(|b| self.to_ui_block(b, base.as_deref()))
+                .collect();
             self.notes_blocks.set_vec(blocks);
             app.set_md_blocks(ModelRc::from(self.notes_blocks.clone()));
             *self.notes_last_source.borrow_mut() = body.clone();
@@ -2232,7 +2278,7 @@ impl State {
             text: text.into(),
             streaming: false,
             // 用户消息不按 Markdown 解析:随手打的表情、星号不该被吃掉
-            blocks: chat_blocks(""),
+            blocks: self.chat_blocks(""),
         });
         self.chat_history.borrow_mut().push(ai::Message {
             role: ai::Role::User,
@@ -2244,7 +2290,7 @@ impl State {
             who: ChatWho::Assistant,
             text: "".into(),
             streaming: true,
-            blocks: chat_blocks(""),
+            blocks: self.chat_blocks(""),
         });
         self.chat_history.borrow_mut().push(ai::Message {
             role: ai::Role::Assistant,
@@ -2355,7 +2401,7 @@ impl State {
                 // 每个 tick 把整段重新切一次块。增量是按 tick 攒过的(见 poll_chat),
                 // 所以这里是 ~20 次/秒、每次几 KB 的量级,完全无所谓;
                 // 换来的好处是不用维护「哪些块已经定型了」这种增量状态。
-                blocks: chat_blocks(&full),
+                blocks: self.chat_blocks(&full),
                 text: full.as_str().into(),
                 streaming,
             },
@@ -2384,7 +2430,7 @@ impl State {
                             who: ChatWho::Note,
                             text: msg.into(),
                             streaming: false,
-                            blocks: chat_blocks(""),
+                            blocks: self.chat_blocks(""),
                         },
                     );
                     // 历史里那条空助手消息也去掉,免得下一轮请求带着一条空的
@@ -2406,7 +2452,7 @@ impl State {
             who: ChatWho::Note,
             text: msg.into(),
             streaming: false,
-            blocks: chat_blocks(""),
+            blocks: self.chat_blocks(""),
         });
         self.set_chat_status(msg);
     }
@@ -2431,7 +2477,7 @@ impl State {
                     ChatMsg {
                         who: row.who,
                         // 最后再切一次:收尾的这一轮增量可能还没进过切块
-                        blocks: chat_blocks(&row.text),
+                        blocks: self.chat_blocks(&row.text),
                         text: row.text,
                         streaming: false,
                     },
@@ -2468,7 +2514,7 @@ impl State {
                         who: ChatWho::Note,
                         text: "已中断".into(),
                         streaming: false,
-                        blocks: chat_blocks(""),
+                        blocks: self.chat_blocks(""),
                     },
                 );
             }
@@ -3192,91 +3238,256 @@ fn empty_cells() -> ModelRc<MdCell> {
     ModelRc::from(Rc::new(VecModel::<MdCell>::default()))
 }
 
-/// 把解析出来的块转成 Slint 侧的 `MdBlock`。
+/// 图片的最大显示尺寸(逻辑像素)。
 ///
-/// 注意两类字段的用途(见 widgets.slint 里 MdBlock 的说明):
-/// `text` 是给 `StyledText` 的富文本,`raw` 是给 `Text` 的**原样纯文本** ——
-/// 代码块和表格必须走 raw,否则代码里的 `*` 会被当成强调标记吃掉。
-fn to_ui_block(block: markdown::Block) -> MdBlock {
-    let s = |t: &str| t.to_string().as_str().into();
-    match block {
-        markdown::Block::Rich(text) => MdBlock {
-            kind: MdKind::Rich,
-            text: styled(&text),
-            raw: s(&text),
-            level: 1,
-            lang: "".into(),
-            cells: empty_cells(),
-        },
-        markdown::Block::Heading { level, text } => MdBlock {
-            kind: MdKind::Heading,
-            text: styled(&text),
-            raw: s(&text),
-            level: level as i32,
-            lang: "".into(),
-            cells: empty_cells(),
-        },
-        markdown::Block::Code { lang, code } => MdBlock {
-            kind: MdKind::Code,
-            text: slint::StyledText::from_plain_text(""),
-            raw: s(&code),
-            level: 1,
-            lang: s(&lang),
-            cells: empty_cells(),
-        },
-        markdown::Block::Quote(text) => MdBlock {
-            kind: MdKind::Quote,
-            text: styled(&text),
-            raw: s(&text),
-            level: 1,
-            lang: "".into(),
-            cells: empty_cells(),
-        },
-        markdown::Block::Rule => MdBlock {
-            kind: MdKind::Rule,
-            text: slint::StyledText::from_plain_text(""),
-            raw: "".into(),
-            level: 1,
-            lang: "".into(),
-            cells: empty_cells(),
-        },
-        markdown::Block::Table(rows) => {
-            // 拍平成一维 + 带行列号:Slint 那边要用 GridLayout 的 row/column 摆
-            let cells: Vec<MdCell> = rows
-                .iter()
-                .enumerate()
-                .flat_map(|(r, row)| {
-                    row.iter().enumerate().map(move |(c, text)| MdCell {
-                        text: text.as_str().into(),
-                        row: r as i32,
-                        col: c as i32,
-                        header: r == 0,
-                    })
-                })
-                .collect();
-            MdBlock {
-                kind: MdKind::Table,
-                text: slint::StyledText::from_plain_text(""),
-                raw: "".into(),
-                level: 1,
-                lang: "".into(),
-                cells: ModelRc::from(Rc::new(VecModel::from(cells))),
-            }
-        }
+/// 不设上限的话,一张手机截图(1080×2400)能把预览撑成一条竖线,别的块全被挤到屏幕外。
+/// **只缩不放** —— 小图放大会糊。
+const IMAGE_MAX_W: f32 = 560.0;
+const IMAGE_MAX_H: f32 = 520.0;
+
+/// 一条图片缓存项
+#[derive(Clone)]
+enum ImageSlot {
+    /// 解码好了:图 + **已经算好的显示尺寸**(等比缩进 IMAGE_MAX_* 之内)
+    /// + 原始像素尺寸(看原图那个浮层要用)
+    Ok { image: slint::Image, w: f32, h: f32, nat_w: f32, nat_h: f32 },
+    /// 没成:记下原因,占位框要显示给人看
+    Err(String),
+}
+
+/// 把 `![alt](路径)` 里的路径解析成磁盘上的绝对路径。
+///
+/// - 相对路径按**当前笔记所在目录**解析(`base`),绝对路径照用;
+/// - `http(s)://` / `data:` / `file://` 都不支持 —— 网络图要下载+缓存,内嵌图要 base64,
+///   这一轮都不做,给一句人话当原因。
+///
+/// 这里**故意不拦 `..`**:写笔记的是用户自己,他写 `../截图/a.png` 就是想去那个目录。
+/// (笔记**名**的净化是另一回事,在 `notes::sanitize` 里 —— 那个挡的是名字,不是正文引用。)
+fn resolve_image_path(base: Option<&Path>, url: &str) -> Result<PathBuf, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("路径是空的".into());
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Err("暂不支持网络图片".into());
+    }
+    if lower.starts_with("data:") {
+        return Err("暂不支持内嵌(data:)图片".into());
+    }
+    if lower.starts_with("file://") {
+        return Err("不支持 file:// 写法,直接写盘符路径就行".into());
+    }
+    let path = Path::new(url);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    match base {
+        Some(dir) => Ok(dir.join(path)),
+        None => Err("这里没有基准目录,相对路径解析不了".into()),
     }
 }
 
-/// 把一段 Markdown 正文切成 UI 用的块模型。
+/// 读盘 + 解码 + 算好显示尺寸。
 ///
-/// 空文本给空模型:Slint 的 `[MdBlock]` 字段从 Rust 侧必须是个有效的 ModelRc,
-/// 不能留 undefined。
-fn chat_blocks(markdown: &str) -> ModelRc<MdBlock> {
-    let blocks: Vec<MdBlock> = if markdown.trim().is_empty() {
-        Vec::new()
-    } else {
-        markdown::parse(markdown).into_iter().map(to_ui_block).collect()
+/// 走的是和桌宠帧一样的 `load_from_data`(见 `pet.rs`),不是 `load_from_path` ——
+/// 前者能拿到「读不到 / 解不开」的具体原因,占位框上要显示给人看。
+/// **同步解码**(一张几 MB 的截图几十毫秒),所以外面必须套缓存,见 `State::image_slot`。
+fn load_image_from(path: &Path) -> ImageSlot {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) => return ImageSlot::Err(format!("读不到文件:{err}")),
     };
-    ModelRc::from(Rc::new(VecModel::from(blocks)))
+    // 扩展名当格式提示;认不出来就让 Slint 自己嗅探(它按内容认)
+    let hint = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let image = match slint::Image::load_from_data(&bytes, hint.as_deref()) {
+        Ok(image) => image,
+        Err(err) => return ImageSlot::Err(format!("解不开这张图:{err}")),
+    };
+    let size = image.size();
+    let (iw, ih) = (size.width as f32, size.height as f32);
+    if iw <= 0.0 || ih <= 0.0 {
+        return ImageSlot::Err("图是空的(尺寸 0)".into());
+    }
+    let scale = (IMAGE_MAX_W / iw).min(IMAGE_MAX_H / ih).min(1.0);
+    ImageSlot::Ok {
+        image,
+        w: (iw * scale).round(),
+        h: (ih * scale).round(),
+        nat_w: iw,
+        nat_h: ih,
+    }
+}
+
+/// Markdown 的对齐 → UI 的整数编码(0 左 / 1 中 / 2 右,和 widgets.slint 的 MdCell 对齐)
+fn align_code(align: markdown::Align) -> i32 {
+    match align {
+        markdown::Align::Left => 0,
+        markdown::Align::Center => 1,
+        markdown::Align::Right => 2,
+    }
+}
+
+impl State {
+    /// 把解析出来的块转成 Slint 侧的 `MdBlock`。
+    ///
+    /// 注意两类字段的用途(见 widgets.slint 里 MdBlock 的说明):
+    /// `text` 是给 `StyledText` 的富文本,`raw` 是给 `Text` 的**原样纯文本** ——
+    /// 代码块和表格必须走 raw,否则代码里的 `*` 会被当成强调标记吃掉。
+    ///
+    /// `base` 是**当前笔记所在目录**:正文里 `![](相对路径)` 要按它解析。
+    /// 对话窗那边没有基准目录,传 `None`(那里的本地图只会显示成占位框)。
+    fn to_ui_block(&self, block: markdown::Block, base: Option<&Path>) -> MdBlock {
+        let s = SharedString::from;
+        match block {
+            markdown::Block::Rich(text) => MdBlock {
+                kind: MdKind::Rich,
+                text: styled(&text),
+                raw: s(&text),
+                cells: empty_cells(),
+                ..Default::default()
+            },
+            markdown::Block::Heading { level, text } => MdBlock {
+                kind: MdKind::Heading,
+                text: styled(&text),
+                raw: s(&text),
+                level: level as i32,
+                cells: empty_cells(),
+                ..Default::default()
+            },
+            markdown::Block::Code { lang, code } => MdBlock {
+                kind: MdKind::Code,
+                raw: s(&code),
+                lang: s(&lang),
+                cells: empty_cells(),
+                ..Default::default()
+            },
+            markdown::Block::Quote(text) => MdBlock {
+                kind: MdKind::Quote,
+                text: styled(&text),
+                raw: s(&text),
+                cells: empty_cells(),
+                ..Default::default()
+            },
+            markdown::Block::Rule => MdBlock {
+                kind: MdKind::Rule,
+                cells: empty_cells(),
+                ..Default::default()
+            },
+            markdown::Block::Table { rows, aligns } => {
+                // 拍平成一维 + 带行列号:Slint 那边要用 GridLayout 的 row/column 摆
+                let cells: Vec<MdCell> = rows
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(r, row)| {
+                        let aligns = aligns.clone();
+                        row.iter().enumerate().map(move |(c, text)| MdCell {
+                            text: s(text),
+                            row: r as i32,
+                            col: c as i32,
+                            header: r == 0,
+                            align: aligns.get(c).copied().map(align_code).unwrap_or(0),
+                        })
+                    })
+                    .collect();
+                MdBlock {
+                    kind: MdKind::Table,
+                    cells: ModelRc::from(Rc::new(VecModel::from(cells))),
+                    // 列数给 UI:列宽要均分(Slint 里数一维模型很别扭,这里顺手带过去)
+                    table_cols: rows.first().map(|r| r.len()).unwrap_or(0) as i32,
+                    ..Default::default()
+                }
+            }
+            markdown::Block::Image { alt, url } => {
+                let label = if alt.trim().is_empty() { url.clone() } else { alt };
+                let (ok, image, w, h, nat_w, nat_h, detail) =
+                    match resolve_image_path(base, &url) {
+                        Ok(path) => match self.image_slot(&path) {
+                            ImageSlot::Ok { image, w, h, nat_w, nat_h } => {
+                                (true, image, w, h, nat_w, nat_h, String::new())
+                            }
+                            ImageSlot::Err(err) => (
+                                false,
+                                slint::Image::default(),
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                format!("{}\n{err}", path.display()),
+                            ),
+                        },
+                        Err(err) => (
+                            false,
+                            slint::Image::default(),
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            format!("{url}\n{err}"),
+                        ),
+                    };
+                MdBlock {
+                    kind: MdKind::Image,
+                    image,
+                    image_ok: ok,
+                    image_width: w,
+                    image_height: h,
+                    image_natural_width: nat_w,
+                    image_natural_height: nat_h,
+                    image_label: s(&label),
+                    image_detail: s(&detail),
+                    cells: empty_cells(),
+                    ..Default::default()
+                }
+            }
+            markdown::Block::Tasks(items) => {
+                let tasks: Vec<MdTask> = items
+                    .iter()
+                    .map(|t| MdTask { done: t.done, text: styled(&t.text), line: t.line as i32 })
+                    .collect();
+                MdBlock {
+                    kind: MdKind::Tasks,
+                    tasks: ModelRc::from(Rc::new(VecModel::from(tasks))),
+                    cells: empty_cells(),
+                    ..Default::default()
+                }
+            }
+        }
+    }
+
+    /// 按路径取图,**带缓存**。
+    ///
+    /// 缓存不是优化而是必需:对话流式那条路每个 tick 都会把整段回复重新切块
+    /// (见 `poll_chat`,约 20 次/秒),没缓存的话同一张图每秒要解几十次。
+    /// 键里带**文件修改时间** —— 换了图重开预览就能看到新的,不用重启进程。
+    fn image_slot(&self, path: &Path) -> ImageSlot {
+        let stamp: Option<SystemTime> = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let key = (path.to_path_buf(), stamp);
+        if let Some(hit) = self.image_cache.borrow().get(&key) {
+            return hit.clone();
+        }
+        let slot = load_image_from(path);
+        self.image_cache.borrow_mut().insert(key, slot.clone());
+        slot
+    }
+
+    /// 把一段 Markdown 正文切成 UI 用的块模型。
+    ///
+    /// 空文本给空模型:Slint 的 `[MdBlock]` 字段从 Rust 侧必须是个有效的 ModelRc,
+    /// 不能留 undefined。
+    ///
+    /// ⚠️ 对话那条路**每个 tick 都重建一次**(流式回复),所以图片解码必须吃缓存。
+    fn chat_blocks(&self, markdown: &str) -> ModelRc<MdBlock> {
+        let blocks: Vec<MdBlock> = if markdown.trim().is_empty() {
+            Vec::new()
+        } else {
+            markdown::parse(markdown).into_iter().map(|b| self.to_ui_block(b, None)).collect()
+        };
+        ModelRc::from(Rc::new(VecModel::from(blocks)))
+    }
 }
 
 /// 后台线程:发请求、读流、把增量塞进 channel。
@@ -3505,6 +3716,7 @@ fn main() -> Result<(), slint::PlatformError> {
         notes_status: RefCell::new(String::new()),
         notes_blocks: Rc::new(VecModel::default()),
         notes_last_source: RefCell::new(String::new()),
+        image_cache: RefCell::new(HashMap::new()),
         notes_tick: Cell::new(0),
         notes_timer: RefCell::new(None),
         pet_click_timer: RefCell::new(None),
@@ -3894,6 +4106,10 @@ fn main() -> Result<(), slint::PlatformError> {
             {
                 let s = state.clone();
                 notes.global::<Logic>().on_md_toggle_list(move || s.toggle_notes_list());
+            }
+            {
+                let s = state.clone();
+                notes.global::<Logic>().on_md_toggle_task(move |line| s.toggle_note_task(line));
             }
             // 点 ✕ 也走「先存再藏」那条路(别让用户白写)
             {

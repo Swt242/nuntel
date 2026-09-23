@@ -14,7 +14,7 @@
 // 4. 帧由宿主逐帧推(`pet-frame`),Slint 的 Image 不会自己播动图。
 
 import {
-    AppData, IconButton, Logic, PanelEdge, RingButton, Theme, VCenter,
+    AppData, ClipTextInput, IconButton, Logic, PanelEdge, RingButton, Theme, VCenter,
 } from "widgets.slint";
 
 export component PetWindow inherits Window {
@@ -82,7 +82,7 @@ export component PetWindow inherits Window {
                 padding-right: 4px;
                 spacing: 4px;
 
-                pet-input := TextInput {
+                pet-input := ClipTextInput {
                     text <=> AppData.pet-draft;
                     color: Theme.text;
                     font-size: 13px;
@@ -91,13 +91,14 @@ export component PetWindow inherits Window {
                     horizontal-stretch: 1;
                     init => { self.focus(); }
                     accepted => { Logic.add-quick-task(AppData.pet-draft); }
-                    // 只接管 Esc;其余按键必须 reject,否则输入法/编辑键会被吃掉
-                    key-pressed(ev) => {
+                    // 只接管 Esc;其余一律 false,交给 ClipTextInput 放行 ——
+                    // 不然输入法/编辑键/Shift+Insert 都会被吃掉
+                    extra-key(ev) => {
                         if (ev.text == Key.Escape) {
                             Logic.toggle-pet-input();
-                            accept
+                            true
                         } else {
-                            reject
+                            false
                         }
                     }
                 }
