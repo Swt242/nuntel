@@ -163,6 +163,75 @@ pub fn work_area() -> (i32, i32, i32, i32) {
     }
 }
 
+/// 某个顶层窗口**现在**的矩形 `(x, y, 宽, 高)`,物理像素。窗口还不存在时给 None。
+///
+/// 和 Slint 的 `Window::position()/size()` 的区别:那两个是 Slint 自己记的值,
+/// 尺寸那份要等 winit 的 Resized 事件推上来才更新 —— 刚改过尺寸就读,拿到的是旧值。
+/// 摆桌宠位置时这一步错不得(见 `State::layout_pet_window`),所以直接从系统问。
+pub fn window_rect(title: &str) -> Option<(i32, i32, i32, i32)> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let hwnd = hwnd_by_title(title);
+        if hwnd == 0 {
+            return None;
+        }
+        let mut r = RECT::default();
+        // SAFETY: 句柄是 FindWindowW 刚找到的;传的是本地 RECT 的指针
+        if unsafe { GetWindowRect(hwnd as _, &mut r) } == 0 {
+            return None;
+        }
+        Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+        None
+    }
+}
+
+/// 一次调用就把窗口的位置和大小都改掉,成功返回 true。
+///
+/// **为什么不能用 Slint 的 `set_size` + `set_position` 两次**:桌宠的底边是钉死的
+/// (宠物贴着窗口底,窗口只往上长),所以每次展开/收起都要「高度变 h、y 跟着变 h」。
+/// 拆成两次调用时中间必有一个矩形是错的 —— `set_size` 不动左上角,于是底边先跳
+/// 一下,下一句才挪回来。这个中间状态**真的会被画出来**:抓屏抓到过宠物被截掉
+/// 半截、窗口里还是上一帧旧内容的那几帧,一帧 16ms 就够用户看见「点一下晃一下」。
+/// `SetWindowPos` 收位置和尺寸在同一个调用里,不存在这个中间态。
+///
+/// 坐标是**物理像素**(Win32 的口径)。不激活、不改 z 序 —— 桌宠是置顶的工具窗,
+/// 顺带被 `SetWindowPos` 抢了焦点或者踢出置顶层都是事故。
+pub fn set_window_rect(title: &str, x: i32, y: i32, w: i32, h: i32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos,
+        };
+        let hwnd = hwnd_by_title(title);
+        if hwnd == 0 {
+            return false;
+        }
+        // SAFETY: 句柄有效,其余全是标量参数
+        unsafe {
+            SetWindowPos(
+                hwnd as _,
+                std::ptr::null_mut(),
+                x,
+                y,
+                w,
+                h,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            ) != 0
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (title, x, y, w, h);
+        false
+    }
+}
+
 /// 鼠标指针在屏幕上的物理坐标。
 ///
 /// 拖桌宠用:窗口是跟着指针走的,**窗口内的相对坐标不会变**(指针和窗口一起移动),
@@ -624,6 +693,9 @@ pub struct Tray {
     settings_id: tray_icon::menu::MenuId,
     pet_item: tray_icon::menu::CheckMenuItem,
     quit_id: tray_icon::menu::MenuId,
+    /// 诊断用:上一次报过的图标位置。图标的屏幕坐标只有系统知道
+    /// (`Shell_NotifyIconGetRect`),自动化测试得先把它问出来。
+    last_rect: std::cell::RefCell<Option<(i32, i32, i32, i32)>>,
 }
 
 impl Tray {
@@ -657,6 +729,17 @@ impl Tray {
             .with_tooltip("Nuntel")
             .with_icon(icon)
             .with_menu(Box::new(menu))
+            // ⚠️ **必须关掉「左键弹菜单」**(它默认是开的)。
+            //
+            // 开着的话,一次左键会同时干两件事:系统弹出菜单,我们这边又把同一个
+            // 左键当成 `TrayAction::Open` 把主窗口叫出来 —— 而窗口一显示就抢走焦点,
+            // 系统当场把那个菜单关掉。用户手刚移到「今天」上,菜单已经没了,
+            // 点下去落在空处(实测:日志里只有图标点击,一条菜单事件都没有,
+            // 用户看到的正是「菜单关了,什么也没有发生」)。
+            //
+            // 现在分工:**左键 = 打开主窗口**(关窗后最常用的动作,一下点到),
+            // **右键 = 菜单**(menu_on_right_click 默认就是开的)。
+            .with_menu_on_left_click(false)
             .build()
             .map_err(|e| format!("创建托盘失败: {e}"))?;
 
@@ -667,6 +750,7 @@ impl Tray {
             settings_id: settings.id().clone(),
             pet_item: pet,
             quit_id: quit.id().clone(),
+            last_rect: std::cell::RefCell::new(None),
         })
     }
 
@@ -674,8 +758,30 @@ impl Tray {
     pub fn poll(&self) -> Option<TrayAction> {
         use tray_icon::menu::MenuEvent;
 
+        // 诊断用:图标挪过位置(或第一次拿到)就记一行
+        if let Some(r) = self._icon.rect() {
+            let key = (
+                r.position.x as i32,
+                r.position.y as i32,
+                r.size.width as i32,
+                r.size.height as i32,
+            );
+            if *self.last_rect.borrow() != Some(key) {
+                crate::platform::log(&format!(
+                    "托盘图标位置 x={} y={} w={} h={}",
+                    key.0, key.1, key.2, key.3
+                ));
+                *self.last_rect.borrow_mut() = Some(key);
+            }
+        }
+
         // 菜单事件
         while let Ok(event) = MenuEvent::receiver().try_recv() {
+            // 诊断用:菜单项点没点中、id 对不对得上,只能靠这行日志看
+            crate::platform::log(&format!(
+                "托盘菜单事件 id={:?}(本次运行 open={:?} today={:?} settings={:?} pet={:?} quit={:?})",
+                event.id, self.open_id, self.today_id, self.settings_id, self.pet_item.id(), self.quit_id
+            ));
             if event.id == self.open_id {
                 return Some(TrayAction::Open);
             }
@@ -692,7 +798,7 @@ impl Tray {
                 return Some(TrayAction::Quit);
             }
         }
-        // 左键单击图标也当「打开主窗口」
+        // 左键单击图标 = 打开主窗口(菜单在右键;为什么这么分见 Tray::new 里那段)
         while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
             if let tray_icon::TrayIconEvent::Click {
                 button: tray_icon::MouseButton::Left,
@@ -700,6 +806,7 @@ impl Tray {
                 ..
             } = event
             {
+                crate::platform::log("托盘:左键单击图标 → 打开主窗口");
                 return Some(TrayAction::Open);
             }
         }

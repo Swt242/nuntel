@@ -1387,11 +1387,27 @@ impl State {
         let pet_size = self.pet_size.get();
         app.set_pet_size(pet_size);
         app.set_pet_count(self.remaining_count());
-        app.set_pet_bubble(self.pet_bubble().into());
-        app.set_pet_adding(self.pet_adding.get());
+        // ⚠️ **这几样的推送顺序是有讲究的**:`pet-ring-band`(宠物盒子上方给那一圈
+        // 留的空白)和 `pet-adding`/`pet-bubble`(叠在盒子上的气泡/输入条)在布局里
+        // 是**叠着**的,两边同时为真时布局要的最小高度(= 条 + 间距 + 宠物盒子)
+        // 会比窗口还高 —— Slint 会把窗口撑到最小高度,而且**只撑不缩**,
+        // 底边就掉下去了(宠物整体低 24px,见 `State::resync_pet_size`)。
+        // 所以**先把归零的那一样推下去**:留白要归零时先推留白,条要归零时先推条。
+        // 两边都非零时反而安全 —— 那时窗口本来就把两样都算进去了。
+        let band = ring_band(self.pet_ring.get());
+        let adding = self.pet_adding.get();
+        let bubble = self.pet_bubble();
+        if band > 0.0 {
+            app.set_pet_adding(adding);
+            app.set_pet_bubble(bubble.as_str().into());
+            app.set_pet_ring_band(band);
+        } else {
+            app.set_pet_ring_band(0.0);
+            app.set_pet_adding(adding);
+            app.set_pet_bubble(bubble.as_str().into());
+        }
         // 那一圈图标的几何(窗口大小就是按它定的,所以只在宿主这边算)
         app.set_pet_ring_open(self.pet_ring.get());
-        app.set_pet_ring_band(ring_band(self.pet_ring.get()));
         app.set_pet_ring_radius(ring_radius(pet_size));
         app.set_pet_ring_icon(RING_ICON);
         app.set_pet_ring_spread(RING_SPREAD);
@@ -1431,26 +1447,8 @@ impl State {
             return;
         }
 
-        // 全用**物理**像素比:指针是系统的物理坐标,窗口位置/尺寸也是物理的,
-        // 而 pet-size 是逻辑的(高 DPI 上要乘缩放,不然判定区会小一圈)
-        let scale = pet.window().scale_factor() as f32;
-        let pet_px = self.pet_size.get() * scale;
-        let pos = pet.window().position();
-        let size = pet.window().size();
-        // 宠物在窗口里横向居中、贴着底边(见 ui/pet.slint 的 pet-box):
-        // 所以不管那一圈开着没有(窗口会变高),圆心都能这么算
-        let (cx, cy) = (
-            pos.x as f32 + size.width as f32 / 2.0,
-            pos.y as f32 + size.height as f32 - pet_px / 2.0,
-        );
-        let (cursor_x, cursor_y) = platform::cursor_pos();
-        let (dx, dy) = (cursor_x as f32 - cx, cursor_y as f32 - cy);
-
-        // 整圈的范围:图标摆在这个半径上,再往外放一个图标半径 + 余量
-        let hit = ring_radius(self.pet_size.get()) * scale
-            + (RING_ICON / 2.0 + RING_SLACK) * scale;
-        let in_ring = dx * dx + dy * dy <= hit * hit;
-        let in_pet = dx.abs() <= pet_px / 2.0 + 2.0 * scale && dy.abs() <= pet_px / 2.0;
+        self.resync_pet_size(&pet);
+        let (in_pet, in_ring) = self.pet_hover(&pet);
 
         // 点完图标先收着,等鼠标离开这一圈再允许重新弹
         if !in_ring {
@@ -1467,6 +1465,74 @@ impl State {
         if want != open {
             self.set_pet_ring(want);
         }
+    }
+
+    /// 盯着窗口的实际尺寸,**被别人改过就按我们的算法摆回去**。
+    ///
+    /// 桌宠的窗口高度只有我们在定,但改它的不止我们:
+    /// - `nudge_window` 启动时顶的那 1px(见那儿);
+    /// - **Slint 自己** —— 布局的*最小*尺寸比窗口还高时,它会
+    ///   `adjust_window_size_to_satisfy_constraints` 把窗口撑到最小尺寸。而最小尺寸
+    ///   是「输入条 + 间距 + 宠物盒子」叠出来的,只要界面上有一帧是「输入条开着 +
+    ///   `pet-ring-band` 还没归零」,最小尺寸就比窗口高 24px。它**只撑不缩**,
+    ///   于是窗口永久停在 278:底边从 1368 掉到 1392,宠物整体低 24px。
+    ///
+    /// 与其指望每一处推送顺序都不出错(踩过一次了),不如在这里兜底:每 40ms
+    /// 对一次,不对就重排。位置是从「窗口现在的位置 + 我们算的高度」反推的,
+    /// 所以纠正回来的是**我们想要的**那个底边,不会被量到的错尺寸带偏。
+    fn resync_pet_size(&self, pet: &PetWindow) {
+        let old_h = self.pet_h.get();
+        if old_h <= 0.0 {
+            return; // 还没摆过,第一次由 layout_pet_window 负责
+        }
+        let scale = pet.window().scale_factor() as f32;
+        let Some((_, _, lw, lh)) = platform::window_rect(platform::PET_TITLE) else { return };
+        let (ew, eh) = ((self.pet_w.get() * scale).round() as i32, (old_h * scale).round() as i32);
+        if (lw - ew).abs() <= 1 && (lh - eh).abs() <= 1 {
+            return;
+        }
+        // 顺带把界面那边的三样记下来 —— 撑窗的罪魁就是它们的一个组合
+        let app = pet.global::<AppData>();
+        platform::log(&format!(
+            "桌宠窗口尺寸被外部改过(量到 {lw}x{lh},应该是 {ew}x{eh});界面:ring={} band={} adding={} bubble={:?}",
+            app.get_pet_ring_open(),
+            app.get_pet_ring_band(),
+            app.get_pet_adding(),
+            app.get_pet_bubble().as_str(),
+        ));
+        // **不能靠把 pet_h 清零来绕过「尺寸没变就早退」**:那个缓存是反推底边用的
+        // 「我们应该有多高」,清零之后整窗会按 0 高度算位置 —— 窗口往上跳一整层
+        // (实测跳了 190px),然后又被下面的检查逮到,越修越远。
+        self.layout_pet_window_forced();
+    }
+
+    /// 指针在不在宠物身上 / 还在不在那一圈里 —— `(in_pet, in_ring)`。
+    ///
+    /// 从 `tick_pet_ring` 里拎出来的:收起输入条时要用同一个判定决定要不要立刻
+    /// 把那一圈叫回来(见 `toggle_pet_input`)。
+    ///
+    /// 全用**物理**像素比:指针是系统的物理坐标,窗口位置/尺寸也是物理的,
+    /// 而 pet-size 是逻辑的(高 DPI 上要乘缩放,不然判定区会小一圈)。
+    fn pet_hover(&self, pet: &PetWindow) -> (bool, bool) {
+        let scale = pet.window().scale_factor() as f32;
+        let pet_px = self.pet_size.get() * scale;
+        let pos = pet.window().position();
+        let size = pet.window().size();
+        // 宠物在窗口里横向居中、贴着底边(见 ui/pet.slint 的 pet-box):
+        // 所以不管那一圈开着没有(窗口会变高),圆心都能这么算
+        let (cx, cy) = (
+            pos.x as f32 + size.width as f32 / 2.0,
+            pos.y as f32 + size.height as f32 - pet_px / 2.0,
+        );
+        let (cursor_x, cursor_y) = platform::cursor_pos();
+        let (dx, dy) = (cursor_x as f32 - cx, cursor_y as f32 - cy);
+
+        // 整圈的范围:图标摆在这个半径上,再往外放一个图标半径 + 余量
+        let hit =
+            ring_radius(self.pet_size.get()) * scale + (RING_ICON / 2.0 + RING_SLACK) * scale;
+        let in_ring = dx * dx + dy * dy <= hit * hit;
+        let in_pet = dx.abs() <= pet_px / 2.0 + 2.0 * scale && dy.abs() <= pet_px / 2.0;
+        (in_pet, in_ring)
     }
 
     /// 开/关那一圈图标:改状态、重排窗口(高度要跟着变)、推给 UI。
@@ -2483,62 +2549,125 @@ impl State {
     /// 按当前内容算出窗口尺寸并摆好位置。
     ///
     /// **底边固定**:气泡/输入条出现时窗口往上长,宠物的脚不动。
-    /// 不这么做的话,一点击宠物就会整体往上跳一下。
+    ///
+    /// 位置一律从**宠物中心**反推,不是拿窗口当前位置加减差值。宠物在窗口里
+    /// 横向居中、贴着底边,所以「中心」是窗口怎么长都不动的那个点;而窗口的左上角
+    /// 每次都在变。从中心反推还有一个好处:它只依赖**当前**的矩形,和上次算的
+    /// 尺寸无关 —— 缓存和实际一旦错开(窗口还没建出来、被系统挪过、刚改完尺寸
+    /// 还没收到事件),加减差值那套就会把宠物一步步带偏,而且回不来。
+    ///
+    /// 落地只能用**一次** `SetWindowPos`,原因见 `platform::set_window_rect`。
     fn layout_pet_window(&self) {
-        let Some(pet) = self.pet.borrow().clone() else { return };
-        let app = pet.global::<AppData>();
+        self.layout_pet_window_inner(false);
+    }
 
-        // 高度 = 宠物 + 顶部给角标留的余量 + 那一圈图标要的高度 + 气泡/输入条
+    /// 同上,但**跳过「尺寸没变就别动」那条短路**(`resync_pet_size` 用)。
+    fn layout_pet_window_forced(&self) {
+        self.layout_pet_window_inner(true);
+    }
+
+    fn layout_pet_window_inner(&self, force: bool) {
+        let Some(pet) = self.pet.borrow().clone() else { return };
+
+        // 高度 = 宠物 + **顶上那一块** + 角标余量。**尺寸恒定,不随内容伸缩。**
+        //
+        // 顶上那一块是三样东西抢的同一块地方:提醒气泡(36)、快速输入条(42)、
+        // 那一圈图标(`RING_GAP + RING_ICON`),按最高的那个留(现在恒为 64)。
+        //
+        // ⚠️ **为什么不能按内容伸缩**(为此踩了整整一轮,详见 §32):
+        // 改窗口尺寸是「`SetWindowPos` 落地」和「Slint 重画」两件事,而 Slint 的重画
+        // 按帧节流 —— 中间那一拍里 DWM 拿的是**旧画面**,铺在新的矩形上,尺寸差多少
+        // 宠物就在那一帧里偏多少。悬停进出宠物、点开输入条、来一条提醒……每次都会
+        // 闪一下(60Hz 下抓屏抓到过一到两帧)。尺寸钉死之后,**宠物在屏幕上就是一块
+        // 完全不动的图**,代价是头顶常驻一块透明的空当(往上约 106px)。
+        //
+        // ⚠️ 那块空当现在**会吃掉落在上面的点击** —— 要治本得再给窗口设区域
+        // (`SetWindowRgn`)把透明的部分挖掉,还没做,见 §32.6。
+        //
+        // 那 42 的余量也不是随手给的:Slint 会拿「布局的最小高度」跟窗口比,小了就
+        // 自己撑大(`adjust_window_size_to_satisfy_constraints`,**只撑不缩**),而布局
+        // 算出来的最小高度比宠物盒子还多 42(具体多算了哪一样没查清,反正是恒定的)。
+        // 少给这 24 窗口就会被撑大、再被 `resync_pet_size` 拉回来,变成周期性闪烁。
+        // 见 §32.4 坑 2。
         let pet_size = self.pet_size.get();
-        let band = ring_band(self.pet_ring.get());
-        let mut h = pet_size + 18.0 + band;
-        if !app.get_pet_bubble().is_empty() {
-            h += 36.0;
-        }
-        if self.pet_adding.get() {
-            h += 42.0;
-        }
+        let h = pet_size + 42.0 + ring_band(true);
         // 宽度:除了给气泡/输入条留位置,还得容得下 ±spread 那两个图标
         // (宠物调到最大时 240 就不够了,会往外撑)
         let r = ring_radius(pet_size);
         let reach = r * RING_SPREAD.to_radians().sin() + RING_ICON / 2.0 + 6.0;
         let w = PET_WIDTH.max(pet_size + 24.0).max(reach * 2.0);
 
-        // 尺寸没变就别动窗口:否则每次同步都 set_position,
+        // 尺寸没变就别动窗口:否则每次同步都重摆一遍,
         // 用户正拖着的时候会被拽回原处。**宽高都要比** —— 只比高度的话,
         // 「宠物调大 → 环把窗口撑宽」这条路径会被这条短路吞掉。
         let old_h = self.pet_h.get();
         let old_w = self.pet_w.get();
-        if old_h > 0.0 && (h - old_h).abs() < 0.5 && (w - old_w).abs() < 0.5 {
+        if !force && old_h > 0.0 && (h - old_h).abs() < 0.5 && (w - old_w).abs() < 0.5 {
             return;
         }
 
-        // 位置分两种:
-        // - **第一次**:默认停在工作区右下角。这里必须把 x 也一起算,
-        //   不能沿用窗口当时的 x —— 刚创建时它是 0,宠物会跑到屏幕最左边。
-        // - **之后**:从窗口**当前位置**往上长。用当前位置而不是另记一个坐标,
-        //   是为了让用户拖动之后,下次展开输入条仍然从他放的地方长出来。
+        // 整个几何都用**物理**像素算:窗口矩形、工作区、指针都是物理的,
+        // 而 pet-size / 这几个常量是逻辑的(高 DPI 上必须乘缩放)。
+        let scale = pet.window().scale_factor() as f32;
+        let pet_px = pet_size * scale;
+
+        // 宠物中心(物理)=(窗口横向正中, 窗口底边往上 pet/2)。逐项说清楚:
+        //
+        // - **窗口位置/宽度用量的**(`platform::window_rect` 问系统要,不用 Slint
+        //   缓存的那份 —— 它的尺寸要等 Resized 事件推上来才更新,连着改两次时
+        //   第二次读到的还是旧的)。横向量到的中心**就是宠物现在待的地方**:
+        //   宠物在窗口里居中,窗口横向怎么变它都不动,所以按量到的来不会被谁带偏。
+        // - **高度用我们自己的 `old_h`,不用量到的**。桌宠的窗口并不只有我们在改:
+        //   启动时那下 ±1px 重排、以及 Slint 自己(布局的**最小**尺寸比窗口高时
+        //   它会直接把窗口撑大,只撑不缩)都会从左上角改高度。那些改动都会让
+        //   「量到的底边」比真正的底边低,而底边是宠物唯一的落脚点 ——
+        //   拿量到的当基准就会把错的位置固定下来(实测:宠物浮在离屏幕底 87px
+        //   的地方,而且再也下不来)。
         let first = old_h <= 0.0;
-        let pos = pet.window().position();
-        let (wx, wy, ww, wh) = platform::work_area();
-        let x = if first {
-            (wx + ww - w as i32 - PET_MARGIN) as f32
-        } else {
-            // 宽度变了要让 x 反向补一半:宠物在窗口里是**居中**的,
-            // 只往右长的话它会跟着往右挪,在屏幕上横着跳一下
-            pos.x as f32 - (w - old_w) / 2.0
-        };
-        let bottom = if first {
-            (wy + wh - PET_MARGIN) as f32
-        } else {
-            pos.y as f32 + old_h
+        let live = platform::window_rect(platform::PET_TITLE);
+        let (cx, cy) = match live {
+            Some((x, y, lw, _)) => {
+                (x as f32 + lw as f32 / 2.0, y as f32 + old_h * scale - pet_px / 2.0)
+            }
+            // 句柄没了:托盘里把桌宠关掉过 —— Slint 隐藏窗口时会**销毁** winit
+            // 窗口,顺手把当时的位置尺寸记进 attributes(它自己也是这么记住的)。
+            // 照那份摆,别把用户拖过去的位置丢了。
+            None if !first => {
+                let pos = pet.window().position();
+                (
+                    pos.x as f32 + pet.window().size().width as f32 / 2.0,
+                    pos.y as f32 + old_h * scale - pet_px / 2.0,
+                )
+            }
+            // 窗口还没建出来(启动时第一次调用):默认停在工作区右下角。
+            // 这里必须把中心整个算出来,不能沿用窗口当时的坐标 —— 那时它还是 0,
+            // 宠物会跑到屏幕左上角去。
+            None => {
+                let (wx, wy, ww, wh) = platform::work_area();
+                let margin = PET_MARGIN as f32 * scale;
+                (
+                    (wx + ww) as f32 - margin - w * scale / 2.0,
+                    (wy + wh) as f32 - margin - pet_px / 2.0,
+                )
+            }
         };
         self.pet_h.set(h);
         self.pet_w.set(w);
 
+        let nx = (cx - w * scale / 2.0).round() as i32;
+        let ny = (cy + pet_px / 2.0 - h * scale).round() as i32;
+        let nw = (w * scale).round() as i32;
+        let nh = (h * scale).round() as i32;
+
+        // 没有句柄时(上面那两个 None 分支)只能走 Slint 的两次调用 —— 这一步还得
+        // 让 Slint 记住这个尺寸:它建窗口用的就是 `has_explicit_size` 记下的那个数,
+        // 不先设一次,窗口会按布局的推荐尺寸(220x140)建出来再被下面改一次。
+        if live.is_some() && platform::set_window_rect(platform::PET_TITLE, nx, ny, nw, nh) {
+            return;
+        }
         pet.window().set_size(slint::LogicalSize::new(w, h));
         pet.window()
-            .set_position(slint::LogicalPosition::new(x, bottom - h));
+            .set_position(slint::LogicalPosition::new(nx as f32 / scale, ny as f32 / scale));
     }
 
     /// 双击宠物:把主窗口叫出来
@@ -2614,30 +2743,53 @@ impl State {
         was
     }
 
-    /// 点宠物:展开 / 收起快速添加
+    /// 点宠物:展开 / 收起快速添加。
+    ///
+    /// **不再顺带换动画**(以前展开切「看书」、收起切回待机):点一下只该开个输入条,
+    /// 动画交给待机轮播自己走。顺带修掉一个副作用 —— 那两下会把「这个待机住够多久」
+    /// 的计时重置掉,点得多的时候轮播就再也轮不起来了。
     fn toggle_pet_input(&self) {
         if self.take_pet_just_dragged() {
             return;
         }
+        let Some(pet) = self.pet.borrow().clone() else { return };
+        let app = pet.global::<AppData>();
         let open = !self.pet_adding.get();
         self.pet_adding.set(open);
-        if !open {
+
+        // ⚠️ **先推「输入条开没开」还是先动那一圈,顺序是有讲究的。**
+        //
+        // 桌宠盒子的高度 = 宠物 + `pet-ring-band`,而输入条/气泡是**摆在它上面**的,
+        // 所以「布局要的最小高度」= 输入条 + 间距 + 宠物盒子。这两样分两次推给界面,
+        // 中间就会有一帧是「输入条开着 + 环的留白还没撤」—— 那时最小高度比窗口还高,
+        // 而 **Slint 会把窗口撑到最小高度**(`adjust_window_size_to_satisfy_constraints`,
+        // 从左上角撑,而且只撑不缩):实测窗口被撑到 278,底边从 1368 掉到 1392,
+        // 宠物浮在屏幕底边上下不来了。
+        //
+        // 所以:**开**输入条时先把那一圈收掉(留白归 0),**关**的时候先把「关了」
+        // 推出去,之后才轮到那一圈 —— 两头都不会出现「两样同时占着」的中间帧。
+        if open {
+            // 顺带把那一圈收掉:两样抢的是窗口顶上同一块位置。不在这儿收,就得等
+            // 下一拍悬停判定(40ms)自己发现「忙」而收起来 —— 中间那些帧窗口高度是
+            // 「环 + 输入条」两样都占着,一次点击等于连改两次高度。
+            self.set_pet_ring(false);
+            app.set_pet_adding(true);
+        } else {
             // 收起时把草稿清掉 —— 留着的话下次展开会看到上次没发出去的内容
-            if let Some(pet) = self.pet.borrow().clone() {
-                pet.global::<AppData>().set_pet_draft("".into());
+            app.set_pet_adding(false);
+            app.set_pet_draft("".into());
+            // 指针还在宠物/那一圈附近的话,**当场**把那一圈叫回来,别等下一拍悬停
+            // 判定(40ms)。等的那一下里「输入条没了、环也还没开」,窗口会先缩回
+            // 空闲那一档再长回来 —— 又是两次改高度。
+            // 判据和 `tick_pet_ring` 共用同一个 `pet_hover`,不会打架。
+            if !self.pet_ring_dismissed.get() {
+                let (in_pet, in_ring) = self.pet_hover(&pet);
+                if in_pet || in_ring {
+                    self.set_pet_ring(true);
+                }
             }
         }
-        // 展开 = 看书;收起就回待机 —— 交给轮播挑一个,别写死 idle-1
-        // (写死的话收起之后永远只播同一个,又变回「只有一个动画」了)
-        if open {
-            self.play_pet_cue("read");
-        } else {
-            self.back_to_idle();
-        }
         self.layout_pet_window();
-        if let Some(pet) = self.pet.borrow().clone() {
-            pet.global::<AppData>().set_pet_adding(open);
-        }
     }
 
     /// 从桌宠直接加一条任务(不带日期 —— 快速记一笔的场景)
@@ -2880,15 +3032,18 @@ impl State {
             .and_then(|tray| tray.poll());
         let Some(action) = action else { return };
         let Some(ui) = self.ui.upgrade() else { return };
+        platform::log(&format!("托盘动作: {action:?}"));
 
         match action {
             TrayAction::Open => {
                 let _ = self.reveal(&ui, platform::WINDOW_TITLE);
             }
             TrayAction::Today => {
-                let _ = self.reveal(&ui, platform::WINDOW_TITLE);
+                // 先把视图和游标摆好,**再**把窗口亮出来:反过来的话第一帧画的是
+                // 上次那个视图,窗口起来时能看见它翻一下页。
                 self.set_view(View::Calendar);
                 self.goto_today();
+                let _ = self.reveal(&ui, platform::WINDOW_TITLE);
             }
             TrayAction::Settings => {
                 self.open_settings();
@@ -2995,13 +3150,23 @@ impl State {
         // 直接拿物理数当逻辑用会在高 DPI 上把窗口缩小。
         let scale = ui.window().scale_factor();
         let size = ui.window().size().to_logical(scale);
-        ui.window()
-            .set_size(slint::LogicalSize::new(size.width, size.height + 1.0));
+        let nudged = slint::LogicalSize::new(size.width, size.height + 1.0);
+        ui.window().set_size(nudged);
 
         let weak = ui.as_weak();
         let timer = Timer::default();
         timer.start(TimerMode::SingleShot, Duration::from_millis(120), move || {
-            if let Some(ui) = weak.upgrade() {
+            let Some(ui) = weak.upgrade() else { return };
+            // **只有尺寸还是我们顶过的那一次,才收回来。**
+            //
+            // 这 120ms 里窗口完全可能因为别的原因改过大小 —— 桌宠就是:启动时鼠标
+            // 正好停在宠物身上,那一圈图标弹出来,窗口得长高 64px。这时候要是拿
+            // 120ms 前存下的旧尺寸设回去,等于把那次改动抹掉;而且 `set_size` 是从
+            // **左上角**缩的,桌宠的内容贴着底边,底边就跟着往上跳 ——
+            // 实测:宠物会浮在离屏幕底 87px 的地方,而且再也回不去(新位置被当成
+            // 「用户放的地方」)。
+            let now = ui.window().size().to_logical(ui.window().scale_factor());
+            if (now.height - nudged.height).abs() < 0.5 {
                 ui.window().set_size(size);
             }
         });

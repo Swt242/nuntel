@@ -31,6 +31,9 @@ u32 = bc.u32
 RING_ICON = 44.0
 RING_GAP = 20.0
 RING_SPREAD = 45.0
+# 顶上那条留白:窗口高度**恒定** = 宠物 + 42 + (RING_GAP + RING_ICON),
+# 所以从窗口高度反推宠物边长要减掉它(见 src/main.rs 的 layout_pet_window)。
+PET_TOP_BAND = 42.0 + RING_GAP + RING_ICON
 
 # 三个图标:动作名 → 角度(正上方为 0,左边为负)
 ACTIONS = {"notes": -RING_SPREAD, "list": 0.0, "settings": RING_SPREAD}
@@ -117,24 +120,24 @@ def pet_geometry():
     if not pet:
         raise SystemExit("找不到桌宠窗口(应用没在跑?)")
     x, y, w, h = bc.rect_of(pet)
-    # 宠物边长:环开着时窗口高 - 环那一条,否则就是窗口高 - 给角标留的 18px。
-    # 直接从窗口反推不可靠,用宿主那份存盘值反而更直接 —— 但这里不想读数据文件,
-    # 所以用「环没开时窗口高 - 18」这个式子(悬停之前测一次就够)。
+    # 宠物边长 = 窗口高 - 顶上那条恒定留白(PET_TOP_BAND)。
+    # 宿主那边窗口尺寸是恒定的,所以什么时候量都一样 —— 读宿主存盘值也行,
+    # 但那样就得去碰用户的数据文件,不如直接从窗口反推。
     return pet, (x, y, w, h)
 
 
 def hover_and_grab(settle=0.4):
     """把光标挪到宠物身上,等环弹出来,再把窗口那一块截下来。
 
-    **先把光标挪远、等环收起来再量宠物大小**:环开着时窗口比宠物高一条
-    (`pet-ring-band`),拿那个高度反推宠物边长会多算 64px,后面所有坐标全歪
+    **先把光标挪远、等环收起来再量宠物大小**:环开着时窗口顶上那条留白
+    是算进去的,拿那个高度反推宠物边长会多算,后面所有坐标全歪
     (实测就是这么点空了一次)。
     """
     pet = bc.find(bc.PET_TITLE)
     u32.SetCursorPos(60, 60)
-    time.sleep(0.45)                          # 环收起来,窗口回到「宠物 + 角标余量」
+    time.sleep(0.45)                          # 环收起来,等重画完
     x, y, w, h = bc.rect_of(pet)
-    pet_size = h - 18.0
+    pet_size = h - PET_TOP_BAND
     cx, cy = x + w / 2, y + h - pet_size / 2  # 贴底居中,圆心就是这个
     u32.SetCursorPos(int(cx), int(cy))
     time.sleep(settle)

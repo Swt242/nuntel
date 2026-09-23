@@ -75,13 +75,18 @@ Slint 文档原话:*Global singletons aren't shared between separate windows.* �
 `Rc<Window>`(生成的类型不是 `Clone`)。**启动只显示桌宠**,主窗口故意不上屏;其余界面
 从桌宠的悬停环或托盘菜单打开。唯一的退出路径是托盘「退出」。
 
-两个必须成对出现的辅助函数:
+⚠️ **托盘图标:左键 = 打开主窗口,右键 = 菜单。** `tray-icon` 的
+`menu_on_left_click` **默认是 true**,一定要在 builder 那关掉 —— 开着的话一次左键
+既弹菜单、又走我们的 `TrayAction::Open` 把主窗口叫出来,窗口抢走焦点会让系统
+**当场把菜单关掉**,表现是「菜单一闪、点哪个都没反应」(见 §33)。
 
-- `State::reveal(ui, title)`(`src/main.rs:2748`):`show()` 之后调 `nudge_window`。
+两个必须成对出现的辅助函数(`grep fn reveal` / `fn nudge_window` 找它们):
+
+- `State::reveal(ui, title)`:`show()` 之后调 `nudge_window`。
   因为用带 alpha 的软件渲染器时,Slint 在窗口映射前先渲染的那一帧会让 softbuffer
   认定「缓冲区里已经有内容」,系统给的新画面是全透明的,而 Slint 只补画脏块 ——
   结果**窗口只有一两小块有内容,其余透出桌面**。
-- `State::nudge_window`(`src/main.rs:2788`):高度顶 1px,120ms 后收回。尺寸一变
+- `State::nudge_window`:高度顶 1px,120ms 后收回。尺寸一变
   softbuffer 就重分配缓冲区、age 归 0,Slint 才会整窗口重画。从外面
   `request_redraw()` 没用(那时 winit 窗口还没建出来);
   两次改尺寸挤在同一个 tick 里也会被合成一次、等于没改。
@@ -90,7 +95,7 @@ Slint 文档原话:*Global singletons aren't shared between separate windows.* �
 
 ### 事件循环
 
-`slint::run_event_loop_until_quit()`(`src/main.rs:3559`)—— 故意不用 `ui.run()`,
+`slint::run_event_loop_until_quit()` —— 故意不用 `ui.run()`,
 后者在没有可见窗口时就会退出,而托盘是 `tray-icon` crate 的对象、Slint 并不知道它。
 
 没有 async runtime,全靠 Slint `Timer` + 两个 `std::sync::mpsc` channel:
@@ -130,8 +135,27 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
 
 ### 桌宠
 
-- 桌宠是**应用的入口**:透明、置顶、无边框,内容贴底(`VerticalLayout alignment: end`),
-  窗口变高时只往上长,**宠物的脚不会跳**。高度 = 宠物 + 角标余量 + 环 + 气泡 + 输入条。
+- 桌宠是**应用的入口**:透明、置顶、无边框,内容贴底(`VerticalLayout alignment: end`)。
+- ⚠️ **窗口尺寸恒定**(`宠物 + 42 + 64`),不随内容伸缩 —— 一伸缩就会闪,见下。
+  代价是头顶常驻一块透明的空当,它**会吃掉落在上面的点击**(用 `SetWindowRgn`
+  挖掉是没做的下一步,`docs` §32.6)。
+- **窗口几何只有 `State::layout_pet_window` 一处算**(理由与两个「量到的 vs 自己记的」
+  的坑,见 `platform::set_window_rect` 和 §32.3)。三条硬规矩:
+  1. 落地只能一次 `SetWindowPos`(`platform::set_window_rect`)。`set_size` +
+     `set_position` 分两次调,底下必然有一帧底边是错的,而且**会被画出来**。
+  2. 位置从**宠物中心**反推,不能拿窗口当前位置加减差值。中心横向用**量到的**
+     窗口矩形、纵向用**我们自己记的**高度 —— 窗口不只我们在改(下一行的 nudge、
+     Slint 撑窗),那些改动都从左上角动高,量到的底边会把错位置固定下来。
+  3. 尺寸**恒定**(顶上那一块按最高的 64 留,余量 42 不是 18)—— 悬停、点击、
+     来提醒都不改窗口,也就没有那一拍中间帧;顺带躲开 Slint 的自动撑窗(见下)。
+- ⚠️ **Slint 会按布局的「最小高度」自己把窗口撑大,而且只撑不缩**
+  (`adjust_window_size_to_satisfy_constraints`)。三条防线:`toggle_pet_input` 和
+  `push_pet` 里**先把「归零」的那一样推给界面**(否则中间会出现「输入条开着 +
+  `pet-ring-band` 还没归零」这种最小高度超标的组合);顶上的余量留够 42;
+  `State::resync_pet_size` 每 40ms 对一次实际尺寸兜底。踩坑记录见 §32.4。
+- `State::nudge_window` 收回那 1px 之前**先对一下尺寸**:这 120ms 里窗口可能已经
+  因为别的原因改过(启动时鼠标正好停在宠物上,那一圈弹出来就会),拿旧尺寸设回去
+  等于把那次改动抹掉,而且是从左上角缩的。
 - 悬停那一圈图标只做**上半圈**(桌宠默认在屏幕右下角,下半圈会伸出屏幕/进任务栏);
   几何常量(`RING_ICON` / `RING_GAP` / `RING_SPREAD`)在 `src/main.rs` 顶部,
   改完窗口大小、图标位置、悬停判定范围一起跟着变。
@@ -218,9 +242,10 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
 
 ## 测试
 
-全部是模块内联的 `#[cfg(test)] mod tests`,没有 `tests/` 目录。67 个,分布在
-`ai`(10)、`reminder`(10)、`markdown`(16)、`calendar_info`(5)、`model`(5)、
-`pet`(4)、`main.rs`(17:`mod tests` 时间选择器 6 个 + `mod fling_tests` 滚轮惯性 11 个)。
+全部是模块内联的 `#[cfg(test)] mod tests`,没有 `tests/` 目录。79 个,分布在
+`ai`(10)、`reminder`(10)、`markdown`(16)、`notes`(12)、`calendar_info`(5)、
+`model`(5)、`pet`(4)、`main.rs`(17:`mod tests` 时间选择器 6 个 +
+`mod fling_tests` 滚轮惯性 11 个)。
 
 写测试时的惯例:**纯计算拆成自由函数或独立模块**,这样不用起 UI 就能测。
 `main.rs` 里几个可测的辅助函数(`due_from_picker`、`fling_*`)就是为此留在模块级的。
@@ -230,7 +255,7 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
 
 ## 验证 UI 的自动化工具
 
-`tools/` 下是一堆验证脚本(排查 UI 问题留下的家当,`.gitignore` 不收 `tmp/` 里的产物)。
+`tools/` 下是一堆验证脚本(排查 UI 问题留下的家当;临时产物写 `tmp/`,那儿不进仓库)。
 它们用 `FindWindowW` + `SetCursorPos` + `mouse_event` 驱动真实窗口:
 
 - `tools/pet-ring.py`(Python)—— **首选范式**:一个进程里一口气做完「挪光标 → 等环弹出 →
@@ -264,11 +289,21 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
   `double-clicked` 一次都不进(试过 20~350ms 五档间隔)。怀疑是非激活工具窗口
   收不到 `WM_LBUTTONDBLCLK`。**对话窗目前只有双击桌宠一个入口**,所以那条路上的
   东西自动化验不到,见 §29.6。
+- **「闪一下」这类问题只能逐帧抓**:`PrintWindow` 和单张截图都看不见中间帧(它画的是
+  「现在」的内容,而问题就出在「现在」只持续了 16ms)。管用的办法是**连续抓屏**
+  (`BitBlt` 一块区域,60fps 能抓到)+ **同时记 `GetWindowRect`**,再把「每一帧变了什么」
+  打成时间线 —— §32 那个「窗口先变了、内容还没跟上」就是这么抓到的。判「宠物有没有动」
+  看窗口底边和宠物中心,比看画面像素靠谱。
+- ⚠️ **这台机器上有两个测量陷阱**:壁纸是**动的**(那段带 `Video` 字样的画面),
+  「和某个背景色比」判断有没有像素会一直误判;用户的**真鼠标随时会被挪一下**,
+  按住不放那种操作中途会跑掉。所以:比「和上一帧的差」而不是比固定颜色;
+  合成点击**要重试**,而且得让被测的那件事留个**可观察的痕迹**(写一行日志、
+  窗口位置变一下)才知道这一下点中没有 —— 别拿「画面看着像」当判据。
 
 ## 文档
 
-- `README.md`(457 行)—— 给用户看的:功能、外观主题、桌宠、AI 对话、Markdown、
-  渲染器选择、代码结构。改动面向用户的特性时同步更新。
-- `docs/calendar-reminders.md`(1946 行)—— 产品设计文档 + 每轮的验收结果,
-  按 § 编号,§11 之后每一节末尾都有「这一轮踩到的坑」。**代码注释直接引用这些编号**,
+- `README.md` —— 给用户看的:功能、外观主题、桌宠、AI 对话、Markdown、渲染器选择、
+  代码结构。改动面向用户的特性时同步更新。
+- `docs/calendar-reminders.md` —— 产品设计文档 + 每轮的验收结果,按 § 编号(已到 §32),
+  §11 之后每一节末尾都有「这一轮踩到的坑」。**代码注释直接引用这些编号**,
   所以新增一节时接着编号往下写,别插队。
