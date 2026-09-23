@@ -5,7 +5,43 @@
 //
 // 分工见 src/markdown.rs 顶部:Rust 切块级,行内样式交给 Slint 的 StyledText。
 
-import { MdBlock, MdCell, MdKind, Theme, TodoCheck, VCenter } from "widgets.slint";
+import { MdBlock, MdCell, MdCodeSpan, MdKind, Theme, TodoCheck, VCenter } from "widgets.slint";
+
+/// 代码块里的一行:横向摆若干段同色文字。
+///
+/// ⚠️ 为什么单独拆成一个组件:**Slint 不支持行内嵌套的 `for`**
+/// (`for a in x : for b in y : ...` 直接语法错),而高亮结果天生是二维的
+/// (行 → 段)。拆一层组件、每层只留一个 `for`,就绕过去了。
+component MdCodeLineView inherits HorizontalLayout {
+    in property <[MdCodeSpan]> spans;
+
+    spacing: 0;
+    // ⚠️ **`alignment: start` 是必须的,别删。**
+    //
+    // Slint 的布局**默认会把多余的宽度平分给各个子项**(不是 `spacing` 的事,
+    // 也不是 `horizontal-stretch: 0` 压得住的 —— 两个都试过,没用)。一行代码拆成
+    // 几十段之后,这些「平分出来的空隙」就变成满屏的缝:`pub   fn   main () ->   Result <>`,
+    // 一眼就看得出不对,但特别容易误判成字体或字距问题。
+    // 压成 start 之后,各段按自己的宽度挨着排,和整行一个 Text 渲染出来一模一样。
+    alignment: start;
+
+    for sp in spans : Text {
+        text: sp.text;
+        font-family: "Consolas";
+        font-size: 12px;
+        // 类别 → 主题色。**直接写三元链、不抽函数**:Slint 的函数是纯函数语义,
+        // 读属性的那种会被判成 impure,绑定里调不了(见 widgets.slint 那段注释)。
+        // 颜色字面量一个都不许出现在这儿 —— 配色令牌在 Theme 里派生
+        color: sp.class == 1 ? Theme.code-keyword
+            : sp.class == 2 ? Theme.code-string
+            : sp.class == 3 ? Theme.code-comment
+            : sp.class == 4 ? Theme.code-number
+            : sp.class == 5 ? Theme.code-function
+            : sp.class == 6 ? Theme.code-type
+            : Theme.text;
+        wrap: no-wrap;
+    }
+}
 
 /// 一块的渲染。
 ///
@@ -80,23 +116,24 @@ export component MdBlockView inherits Rectangle {
         width: parent.width;
         x: 0;
         y: 5px;
-        height: code-text.preferred-height + 16px;
+        height: code-lines.preferred-height + 16px;
         border-radius: 8px * Theme.radius-scale;
         background: Theme.inset;
         border-width: 1px;
         border-color: Theme.border;
+        // 代码**不折行**(折了就看不出缩进结构),超宽部分裁掉。
+        // 以前是一个 Text 靠 `overflow: elide`;语法高亮之后一行拆成了许多段文字,
+        // 没法再交给单个 Text 去省略,改成 clip —— 视觉上差不多
+        clip: true;
 
-        code-text := Text {
-            text: block.raw;
-            width: parent.width - 20px;
+        code-lines := VerticalLayout {
             x: 10px;
             y: 8px;
-            font-family: "Consolas";
-            font-size: 12px;
-            color: Theme.text;
-            // 代码**不折行**:折了就看不出缩进结构,超宽部分裁掉
-            wrap: no-wrap;
-            overflow: elide;
+            width: parent.width - 20px;
+            spacing: 0;
+
+            // 一行一个 MdCodeLineView(嵌套 for 的问题见上面那个组件的注释)
+            for line in block.lines : MdCodeLineView { spans: line.spans; }
         }
     }
 

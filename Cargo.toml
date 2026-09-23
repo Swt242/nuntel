@@ -12,6 +12,17 @@ serde_json = "1.0.151"
 slint = "1.18.0"
 tauri-winrt-notification = "0.8.1"
 tray-icon = "0.25.1"
+# 代码块语法高亮。tree-sitter 本体是 C 库(经 cc 编),各语言再单独引一个语法包 ——
+# **每加一门语言 = 这里加一行 + src/highlight.rs 的注册表加一行**,别的地方不用动。
+# 认不出的语言原样单色,不报错。
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
 # OpenAI 兼容对话用的 HTTP 客户端。**故意选同步阻塞的**:本应用没有 async runtime
 # (全程靠 Slint 的 Timer + channel 驱动),流式读取丢到一个后台线程里跑,
 # 增量通过 channel 送回主线程就行,不值得为这个引 tokio。

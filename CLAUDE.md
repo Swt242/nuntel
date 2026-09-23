@@ -21,11 +21,13 @@ exe 文件名、托盘悬停提示、数据目录。
 ```sh
 cargo run --release --features skia   # 推荐:文字最锐 + 桌宠能透明
 cargo run                             # 不带 skia:文字稍糊,桌宠是一块黑方块
-cargo test --release                  # 79 个单测,应该全过
+cargo test --release                  # 93 个单测,应该全过
 cargo test --release fling            # 只跑名字含 "fling" 的
 cargo test --release model::tests::badge_shows_overdue_and_relative_days
 ```
 
+- **加新依赖要联网**,本机得走代理:`HTTPS_PROXY=http://127.0.0.1:7890 cargo fetch`
+  (语法高亮那几个 tree-sitter 包就是这么拉的;C 代码由 `cl.exe` 编,MSVC 下没问题)。
 - **默认 MSVC 工具链**(本机装了 VS 2022 Build Tools)。`run.sh` 是没装 MSVC 时的
   GNU 后备方案,会补 MinGW 导入库和 binutils,用 `./run.sh test --release` 这样调。
   ⚠️ `--features skia` 在 GNU 工具链下**编不过**(Skia 只有 MSVC 的预编译包)。
@@ -130,6 +132,13 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
   工业风的信号黄当填充好用、当文字对比度只有 1.7:1,亮色下 `accent-ink` 取深金。
 - **Slint 语言里没有任何模糊原语**,玻璃感靠「本来就是糊的底」(径向渐变色斑)
   和半透明面板 + 1px 发丝边 + 顶部高光(`PanelEdge`)。
+- ⚠️ **把一个字符串拆成很多段 `Text` 排在一行时,布局默认会把多余宽度平分给每一段**
+  —— 渲染出来到处是缝(`pub   fn   main ()`)。`spacing: 0` 和 `horizontal-stretch: 0`
+  **都压不住**,得给那行布局加 `alignment: start`(代码块语法高亮那一轮踩的,§36)。
+- ⚠️ **Slint 的函数是「纯函数」语义**:读属性的函数不能在属性绑定里调
+  (报 `Call of impure function`)。所以「类别 → 颜色」这类映射只能就地写三元链。
+- ⚠️ **`if ... :` 会插一层隐式父级**,里面的 `parent` 不再是本来的父元素 ——
+  浮层那种要铺满窗口的元素,几何一律用 `root.` 写。
 - 压在桌面/其它窗口上的浮层用 `Theme.sheet`(几乎不透明),不能用透明底 ——
   别人窗口的颜色会穿过来和自己的字叠在一起。
 
@@ -232,7 +241,8 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
 | `src/model.rs` | 数据结构、时间推导、读写盘、v1→v2 迁移、文件路径 |
 | `src/reminder.rs` | 提醒判定与通知文案(算出来,不发通知),错过 7 天以上只标记不弹 |
 | `src/ai.rs` | OpenAI 兼容协议:拼请求、解析 SSE。**纯协议,不联网不碰 UI** |
-| `src/markdown.rs` | Markdown **块级**切分(标题/代码块/引用/分隔线/表格),行内样式故意交给 Slint 的 `StyledText` |
+| `src/markdown.rs` | Markdown **块级**切分(标题/代码块/引用/分隔线/表格/图片/任务列表),行内样式故意交给 Slint 的 `StyledText` |
+| `src/highlight.rs` | 代码块语法高亮:tree-sitter 解析 + 跑各语言的 highlights query,产出「按行按段 + 类别」;认不出的语言单色退化 |
 | `src/notes.rs` | 笔记库:`notes\` 下的增删改查、文件名净化、撞名退避、老单文件迁移。**所有函数都显式吃一个 `dir`**,单测才能往临时目录里造文件而不碰用户的库 |
 | `src/pet.rs` | 桌宠帧的加载与推进 |
 | `src/calendar_info.rs` | 农历、节日、放假调休(离线) |
@@ -242,10 +252,9 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
 
 ## 测试
 
-全部是模块内联的 `#[cfg(test)] mod tests`,没有 `tests/` 目录。79 个,分布在
-`ai`(10)、`reminder`(10)、`markdown`(16)、`notes`(12)、`calendar_info`(5)、
-`model`(5)、`pet`(4)、`main.rs`(17:`mod tests` 时间选择器 6 个 +
-`mod fling_tests` 滚轮惯性 11 个)。
+全部是模块内联的 `#[cfg(test)] mod tests`,没有 `tests/` 目录。93 个,分布在
+`markdown`(24)、`main.rs`(17:`mod tests` 时间选择器 6 个 + `mod fling_tests` 滚轮惯性 11 个)、
+`notes`(12)、`ai`(10)、`reminder`(10)、`highlight`(6)、`calendar_info`(5)、`model`(5)、`pet`(4)。
 
 写测试时的惯例:**纯计算拆成自由函数或独立模块**,这样不用起 UI 就能测。
 `main.rs` 里几个可测的辅助函数(`due_from_picker`、`fling_*`)就是为此留在模块级的。

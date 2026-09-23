@@ -116,6 +116,20 @@ export struct MdCell {
     align: int,
 }
 
+/// 代码块里的一段**同色**文字(语法高亮的最小单位)
+export struct MdCodeSpan {
+    text: string,
+    /// 语法类别:**0 普通 / 1 关键字 / 2 字符串 / 3 注释 / 4 数字 / 5 函数 / 6 类型**
+    /// —— 编码和 `src/highlight.rs` 的 `TokenClass::code()` 对齐,
+    /// 颜色由 `Theme.code-color()` 翻(主题令牌不上 Rust)
+    class: int,
+}
+
+/// 代码块里的一行
+export struct MdCodeLine {
+    spans: [MdCodeSpan],
+}
+
 /// 任务列表里的一项(`- [ ] 文字`)
 export struct MdTask {
     done: bool,
@@ -142,6 +156,10 @@ export struct MdBlock {
     /// 表格**列数**。Rust 侧切表的时候就知道,不用在 Slint 里数一维模型 ——
     /// 列宽要均分(见 markdown.slint),除数得先拿到
     table-cols: int,
+
+    /// 代码块**按行、按段**切好的高亮结果(`raw` 是整段原文,给不了颜色)。
+    /// 认不出的语言每行就是一整段普通文字 —— 见 src/highlight.rs
+    lines: [MdCodeLine],
 
     // ── 图片块(只有 kind == image 时才有意义)──
     /// 已经解码好的图。**尺寸也在这儿算好了**(等比缩到上限之内,见 main.rs),
@@ -376,6 +394,25 @@ export global Theme {
         industrial ? (dark ? #8a8d86 : #6b6e68)
         : glass    ? (dark ? #9aa4b8 : #4a5670)
         :            (dark ? #838b99 : #858c98);
+
+    // ── 代码块的语法高亮配色 ──
+    //
+    // **只跟亮暗走,不跟外观走。** 外观决定的是「质感」(毛玻璃 / 工业风 / 原主题),
+    // 而代码配色只要在代码块那块底色(`Theme.inset`)上读得清就行 —— 三套外观共用一套,
+    // 省得维护 3×2 份、还迟早对不上。数值取自 One Light / One Dark。
+    //
+    // ⚠️ 这几个令牌**只给语法高亮用**,别拿去当普通文字色。
+    out property <color> code-keyword: dark ? #c678dd : #a626a4;
+    out property <color> code-string: dark ? #98c379 : #50a14f;
+    out property <color> code-comment: dark ? #7f848e : #a0a1a7;
+    out property <color> code-number: dark ? #d19a66 : #986801;
+    out property <color> code-function: dark ? #61afef : #4078f2;
+    out property <color> code-type: dark ? #e5c07b : #c18401;
+
+    // ⚠️ 这里**故意不提供 `code-color()` 函数**:Slint 的函数是「纯函数」语义,
+    // 读属性的函数会被判成 impure,在属性绑定里调直接编译报错
+    // (原文:`Call of impure function 'code-color'`)。所以「类别 → 颜色」那张表
+    // 就地写在用它的地方(ui/markdown.slint 的 MdCodeLineView,只有那一处要用)。
 
     // ── 强调色:拆成「填充」和「墨」两种角色 ──
     //

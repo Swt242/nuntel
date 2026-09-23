@@ -14,6 +14,7 @@
 
 mod ai;
 mod calendar_info;
+mod highlight;
 mod markdown;
 mod model;
 mod notes;
@@ -23,6 +24,7 @@ mod reminder;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -511,6 +513,9 @@ struct State {
     /// 解码好的图片。键是 **(绝对路径, 文件修改时间)** —— 带时间是故意的:
     /// 换了图不用重启就能看到新的。见 `State::image_slot`。
     image_cache: RefCell<HashMap<(PathBuf, Option<SystemTime>), ImageSlot>>,
+    /// 语法高亮的结果,键是 **(语言, 代码的哈希)**。见 `State::code_lines`。
+    /// 有上限:打字时每次改动都会算一份新的,不封顶会一直涨。
+    code_cache: RefCell<HashMap<(String, u64), CodeLines>>,
     notes_tick: Cell<i32>,
     /// 预览的刷新定时器(只在窗口可见时跑)
     notes_timer: RefCell<Option<Timer>>,
@@ -3245,6 +3250,13 @@ fn empty_cells() -> ModelRc<MdCell> {
 const IMAGE_MAX_W: f32 = 560.0;
 const IMAGE_MAX_H: f32 = 520.0;
 
+/// 语法高亮缓存的上限(条)。打字时每次改动都会产生一份新的 —— 不封顶会一直涨
+/// (一段长代码就是几百个字符串),所以**超了直接全清**,不值当为它做 LRU。
+const CODE_CACHE_MAX: usize = 64;
+
+/// 代码块高亮好的行(一行 = 若干段同色文字),缓存里存的就是它
+type CodeLines = Rc<Vec<MdCodeLine>>;
+
 /// 一条图片缓存项
 #[derive(Clone)]
 enum ImageSlot {
@@ -3362,6 +3374,8 @@ impl State {
                 kind: MdKind::Code,
                 raw: s(&code),
                 lang: s(&lang),
+                // 语法高亮:按行、按段切好推给界面(配色在 Slint 那边给)
+                lines: ModelRc::from(Rc::new(VecModel::from((*self.code_lines(&lang, &code)).clone()))),
                 cells: empty_cells(),
                 ..Default::default()
             },
@@ -3456,6 +3470,43 @@ impl State {
                 }
             }
         }
+    }
+
+    /// 代码块的语法高亮,**带缓存**。
+    ///
+    /// 缓存不是优化而是必需:对话流式那条路每个 tick 都会把整段回复重新切块
+    /// (见 `poll_chat`,约 20 次/秒),没缓存的话同一段代码每秒要解析几十次 ——
+    /// tree-sitter 解析 + 跑 query 是毫秒级的活儿。
+    ///
+    /// 键里带**代码本身的哈希**(同一段代码改了就是另一份)。认不出的语言走
+    /// `highlight::highlight` 里的单色退化,不报错。
+    fn code_lines(&self, lang: &str, code: &str) -> CodeLines {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        code.hash(&mut hasher);
+        let key = (lang.trim().to_ascii_lowercase(), hasher.finish());
+
+        if let Some(hit) = self.code_cache.borrow().get(&key) {
+            return hit.clone();
+        }
+
+        let lines: Vec<MdCodeLine> = highlight::highlight(lang, code)
+            .into_iter()
+            .map(|spans| {
+                let spans: Vec<MdCodeSpan> = spans
+                    .into_iter()
+                    .map(|s| MdCodeSpan { text: s.text.as_str().into(), class: s.class.code() })
+                    .collect();
+                MdCodeLine { spans: ModelRc::from(Rc::new(VecModel::from(spans))) }
+            })
+            .collect();
+        let lines = Rc::new(lines);
+
+        let mut cache = self.code_cache.borrow_mut();
+        if cache.len() >= CODE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(key, lines.clone());
+        lines
     }
 
     /// 按路径取图,**带缓存**。
@@ -3717,6 +3768,7 @@ fn main() -> Result<(), slint::PlatformError> {
         notes_blocks: Rc::new(VecModel::default()),
         notes_last_source: RefCell::new(String::new()),
         image_cache: RefCell::new(HashMap::new()),
+        code_cache: RefCell::new(HashMap::new()),
         notes_tick: Cell::new(0),
         notes_timer: RefCell::new(None),
         pet_click_timer: RefCell::new(None),
