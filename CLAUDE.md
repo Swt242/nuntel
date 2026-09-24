@@ -47,6 +47,10 @@ cargo test --release model::tests::badge_shows_overdue_and_relative_days
 - **跟随鼠标**(§40)挪窗口走的是 `layout_pet_window` 那条老路,只是多了一个
   `pet_target_center` 入口。⚠️ 走路**必须调 `layout_pet_window_forced()`** ——
   尺寸不变,普通那条会被「没变就别动」的短路整个吞掉。
+- 走路朝右时素材**在像素层左右镜像**(§42):`State::pet_flip` + `PetFrames::frame_mirrored`。
+  ⚠️ 别改用 Slint 的 `transform-scale-x: -1` —— 那套变换在**软件渲染器上是空操作**
+  (官方文档明说),而桌宠要透明只能走软件渲染。三种中止(走完 / 被拖走 / 关开关)
+  统一走 `abort_pet_walk()`。
 
 - 让 AI 驱动运行中的界面做回归:
   `SLINT_EMIT_DEBUG_INFO=1 cargo build --features slint/mcp`,

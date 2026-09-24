@@ -483,6 +483,11 @@ struct State {
     /// 走的时候把窗口摆到**这个宠物中心**(物理像素)。不在走就是 None ——
     /// 窗口几何只认这一个额外输入,其余仍然走原来那套「中心反推」
     pet_target_center: Cell<Option<(f32, f32)>>,
+    /// 这一帧要不要**左右镜像**(走路方向朝右时为真)。
+    ///
+    /// 素材画的都是「往左走」(头朝左),往右走时把帧翻过来才顺眼 ——
+    /// 方向在**出发那一刻**定死(和「目标定死」同一个道理),走完/中止就清掉。
+    pet_flip: Cell<bool>,
     /// 设置窗口里正在**试演**哪个动画(点了那一行的 ☰)。
     ///
     /// 设置页里没有缩略图,预览就是**真桌宠本人**:点一下 ☰,它当场按自己那条
@@ -1482,7 +1487,15 @@ impl State {
     fn push_pet_frame(&self) {
         let Some(pet) = self.pet.borrow().clone() else { return };
         let (anim, frame) = self.pet_anim.get();
-        if let Some(img) = self.pet_frames.frame(anim, frame) {
+        // 走路朝右时用镜像那一份(见 `pet_flip`)。翻不出来就退回原图。
+        let img = if self.pet_flip.get() {
+            self.pet_frames
+                .frame_mirrored(anim, frame)
+                .or_else(|| self.pet_frames.frame(anim, frame))
+        } else {
+            self.pet_frames.frame(anim, frame)
+        };
+        if let Some(img) = img {
             pet.global::<AppData>().set_pet_frame(img);
         }
     }
@@ -1596,12 +1609,17 @@ impl State {
         if let Some((walk, started)) = self.pet_walk.get() {
             let t = now.duration_since(started).as_secs_f32() / walk.secs.max(0.01);
             if t >= 1.0 {
-                // 最后一步落准(别差几像素),然后回待机轮播
+                // 最后一步落准(别差几像素),然后**接着住在这个动画里**。
+                //
+                // 这里原来调的是 `back_to_idle()`(落地立刻换一个待机动画),
+                // 表现是「刚走到就变脸」—— 走了一路的表情在你眼前被换掉,看着像卡了一下。
+                // 现在只是把轮播往后推一个正常的待机时长,那个动画接着播它的下一圈。
                 self.pet_target_center.set(Some(walk.to));
                 self.layout_pet_window_forced();
-                self.pet_walk.set(None);
-                self.pet_target_center.set(None);
-                self.back_to_idle();
+                // 站定了就回到素材本来的朝向(下一趟按新方向再决定翻不翻),
+                // 顺手补推一帧,不然要等下一个帧间隔才「翻回来」
+                self.abort_pet_walk();
+                self.hold_current_anim();
                 return;
             }
             self.pet_target_center.set(Some(pet::curve_point(&walk, t)));
@@ -1658,6 +1676,11 @@ impl State {
         let dir = next_rand(&mut seed);
         self.pet_rng.set(seed);
         let walk = pet::walk_curve(from, target, self.pet_follow_speed.get(), dir);
+
+        // 往哪边走 = 要不要把素材翻过来。**在出发那一刻定死**(和「目标定死」同一个
+        // 道理:半路鼠标再动也继续走原目标,朝向自然也不该中途变)。
+        // 素材画的都是「往左走」,所以只有朝右才翻。
+        self.pet_flip.set(target.0 > from.0);
 
         // 锁住当前动画:走路期间不轮换(照 rotate_pet_idle 末尾那套)。
         // 从头播一遍,看着像「起步」。
@@ -1798,12 +1821,11 @@ impl State {
         self.rotate_pet_idle();
     }
 
-    /// 随机换到另一个待机动画(不连着播同一个)。
     /// 换下一个待机动画。
     ///
     /// **按设置里的顺序一个个走**(顺序就是设置窗口里拖出来的那个),关掉的跳过,
     /// 走到末尾绕回开头 —— 想回到「随便播」的话,不拖它就行(顺序 = manifest 顺序)。
-    /// 顺序固定,但每个动画「住」多久仍然带随机抖动(`PET_IDLE_JITTER_MS`),
+    /// 顺序固定,但每个动画「住」多久仍然带随机抖动(见 `hold_current_anim`),
     /// 所以不会变成节拍器。
     fn rotate_pet_idle(&self) {
         // 「哪些算待机动画」由 `PetFrames::idle_names` 说了算(`idle-` 前缀那条规则
@@ -1818,12 +1840,33 @@ impl State {
         // 一个待机动画都没开(或者素材里就没有 idle):什么都别做,停在当前这个上
         let Some(next) = pet::next_in_cycle(&pool, current) else { return };
 
-        // 只摇一次,只剩「抖动」在用 —— 换哪个不再是随机
+        self.play_pet_anim(next);
+        self.hold_current_anim();
+    }
+
+    /// 中止「走过去」:路线、目标中心、朝向一起清掉。
+    ///
+    /// **朝向必须跟着清 + 补推一帧** —— 不清的话那个镜像的姿势会一直挂在宠物身上
+    /// (「走到一半被拖走,然后一直反着站」),补推一帧是因为下一次推帧可能还要等
+    /// 一个帧间隔(最长 250ms),肉眼能看出它还「反着」。
+    fn abort_pet_walk(&self) {
+        self.pet_walk.set(None);
+        self.pet_target_center.set(None);
+        if self.pet_flip.replace(false) {
+            self.push_pet_frame();
+        }
+    }
+
+    /// 让**当前这个**动画再住一会儿 —— 住够了 `pet_finished_loop` 才会轮到下一个。
+    ///
+    /// 「住多久」在这儿统一算(基础 `PET_IDLE_DWELL` + 一段随机抖动,免得变成节拍器),
+    /// 有两处要用它:
+    /// - `rotate_pet_idle` 换到新动画之后;
+    /// - 跟随走完一趟之后(见 `tick_pet_follow`)—— 落地别立刻换脸。
+    fn hold_current_anim(&self) {
         let mut seed = self.pet_rng.get();
         let jitter = next_rand(&mut seed) % PET_IDLE_JITTER_MS;
         self.pet_rng.set(seed);
-
-        self.play_pet_anim(next);
         self.pet_idle.set(true);
         self.pet_idle_until
             .set(Instant::now() + PET_IDLE_DWELL + Duration::from_millis(jitter));
@@ -1919,8 +1962,7 @@ impl State {
     fn pet_drag_begin(&self, mouse_x: f32, mouse_y: f32) {
         let Some(pet) = self.pet.borrow().clone() else { return };
         // 用户一上手就中止「跟随走路」—— 他要把宠物拖到别处,别跟它抢窗口
-        self.pet_walk.set(None);
-        self.pet_target_center.set(None);
+        self.abort_pet_walk();
         let pos = pet.window().position();
         let cursor0 = (pos.x + mouse_x.round() as i32, pos.y + mouse_y.round() as i32);
         self.pet_drag.set(Some((cursor0, (pos.x, pos.y))));
@@ -2831,8 +2873,7 @@ impl State {
         self.pet_follow.set(on);
         if !on {
             // 关掉的时候把正在走的那一趟也停掉,不然关完它还在半路上
-            self.pet_walk.set(None);
-            self.pet_target_center.set(None);
+            self.abort_pet_walk();
         }
         self.save();
         self.push_pet_settings(); // 勾选框和下面两根滑杆的灰态都要立刻回显
@@ -4087,6 +4128,7 @@ fn main() -> Result<(), slint::PlatformError> {
         pet_cursor_still: Cell::new(Instant::now()),
         pet_walk: Cell::new(None),
         pet_target_center: Cell::new(None),
+        pet_flip: Cell::new(false),
         pet_idle: Cell::new(true),
         pet_preview: RefCell::new(None),
         pet_idle_until: Cell::new(Instant::now()),

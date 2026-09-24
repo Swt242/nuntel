@@ -21,6 +21,8 @@ include!(concat!(env!("OUT_DIR"), "/pet_frames.rs"));
 pub struct PetFrames {
     /// (每帧毫秒, 帧图)
     anims: Vec<(u64, Vec<slint::Image>)>,
+    /// 左右镜像过的帧。**用到哪个动画才现做**(见 `frame_mirrored`)
+    mirrored: std::cell::RefCell<std::collections::HashMap<usize, Vec<slint::Image>>>,
 }
 
 impl PetFrames {
@@ -41,7 +43,7 @@ impl PetFrames {
             }
             anims.push((anim.delay_ms, frames));
         }
-        Self { anims }
+        Self { anims, mirrored: Default::default() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -86,6 +88,69 @@ impl PetFrames {
         let (_, frames) = self.anims.get(anim)?;
         frames.get(frame % frames.len().max(1)).cloned()
     }
+
+    /// 同一个动画的**左右镜像版**那一帧(往右走的时候用,见 `State::pet_flip`)。
+    ///
+    /// 为什么在像素层翻、不用 Slint 的 `transform-scale-x: -1`:那套变换在**软件
+    /// 渲染器上不生效**(官方文档原话「Transforms are not available for the software
+    /// renderer」),而桌宠要透明就只能走软件渲染那条路 —— 写上去是一行,但那一行
+    /// 什么都不会发生。
+    ///
+    /// 代价可以接受:第一次用到某个动画时才现做(5~8 帧 × 224×224×4 ≈ 1.6MB),
+    /// 做完缓存住;走路本来就是低频事件。
+    pub fn frame_mirrored(&self, anim: usize, frame: usize) -> Option<slint::Image> {
+        if let Some(frames) = self.mirrored.borrow().get(&anim) {
+            return frames.get(frame % frames.len().max(1)).cloned();
+        }
+        let (_, src) = self.anims.get(anim)?;
+        let flipped: Vec<slint::Image> = src.iter().filter_map(mirror_image).collect();
+        if flipped.is_empty() {
+            return None; // 一张都翻不出来:让调用方退回原图,别画成空白
+        }
+        let out = flipped.get(frame % flipped.len()).cloned();
+        self.mirrored.borrow_mut().insert(anim, flipped);
+        out
+    }
+}
+
+/// 把一张图左右镜像。拿不到像素就给 `None`(调用方退回原图)。
+///
+/// `to_rgba8` / `from_rgba8` 都是**非预乘**的,配一对用不会有半透明边的问题
+/// (换成 `to_rgba8_premultiplied` 就会,边缘会发暗)。
+fn mirror_image(img: &slint::Image) -> Option<slint::Image> {
+    let src = img.to_rgba8()?;
+    let (w, h) = (src.width(), src.height());
+    let mut out = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
+    let mirrored = mirror_rows(src.as_bytes(), w, h);
+    // `make_mut_slice` 给的是 `&mut [Rgba8Pixel]`(没有按字节的可变视图),
+    // 所以逐像素搬 —— 一次也就 5 万像素,走路这种低频事件看不出来
+    for (i, px) in out.make_mut_slice().iter_mut().enumerate() {
+        let s = &mirrored[i * 4..i * 4 + 4];
+        *px = slint::Rgba8Pixel { r: s[0], g: s[1], b: s[2], a: s[3] };
+    }
+    Some(slint::Image::from_rgba8(out))
+}
+
+/// 把一块**行优先、每像素 4 字节**的像素左右翻转(纯函数,可单测)。
+///
+/// 行不动、每行内部倒过来 —— 表里像素是 `x` 最快的那一维,所以就是每 4 字节一组
+/// 倒着抄一遍。
+pub fn mirror_rows(src: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let stride = w * 4;
+    // 数据对不上就原样返回:宁可画一张没翻的图,也不能 panic 或者越界读
+    if w == 0 || h == 0 || src.len() < stride * h {
+        return src.to_vec();
+    }
+    let mut out = vec![0u8; stride * h];
+    for y in 0..h {
+        let row = &src[y * stride..(y + 1) * stride];
+        let dst = &mut out[y * stride..(y + 1) * stride];
+        for x in 0..w {
+            dst[(w - 1 - x) * 4..(w - 1 - x) * 4 + 4].copy_from_slice(&row[x * 4..x * 4 + 4]);
+        }
+    }
+    out
 }
 
 // ── 播放顺序与开关(纯逻辑,可单测) ────────────────────────────────────
@@ -377,6 +442,41 @@ mod tests {
         // 太近不会瞬移,太远不会走到天荒地老
         assert_eq!(walk_curve((0.0, 0.0), (5.0, 0.0), 1.0, 0).secs, WALK_MIN_SECS);
         assert_eq!(walk_curve((0.0, 0.0), (99999.0, 0.0), 0.25, 0).secs, WALK_MAX_SECS);
+    }
+
+    // ── 左右镜像(往右走时用的帧) ─────────────────────────────────────
+
+    /// 每行倒过来,行与行之间不动
+    #[test]
+    fn mirror_rows_flips_each_row() {
+        // 2×2,一个像素 4 字节;第 0 列全是 1、第 1 列全是 2,好认
+        let src = vec![
+            1, 1, 1, 1, 2, 2, 2, 2, //
+            3, 3, 3, 3, 4, 4, 4, 4,
+        ];
+        assert_eq!(
+            mirror_rows(&src, 2, 2),
+            vec![
+                2, 2, 2, 2, 1, 1, 1, 1, //
+                4, 4, 4, 4, 3, 3, 3, 3,
+            ]
+        );
+    }
+
+    /// 翻两次回到原样;数据长度对不上就原样返回(不 panic)
+    #[test]
+    fn mirror_rows_is_its_own_inverse() {
+        let src: Vec<u8> = (0..(3 * 2 * 4) as u8).collect();
+        assert_eq!(mirror_rows(&mirror_rows(&src, 3, 2), 3, 2), src);
+        assert_eq!(mirror_rows(&[7, 7, 7], 3, 2), vec![7, 7, 7], "长度不够原样返回");
+        assert_eq!(mirror_rows(&[], 0, 0), Vec::<u8>::new(), "空图不能炸");
+    }
+
+    /// 透明像素的 4 个字节(含 alpha)一起搬,不能只翻 RGB
+    #[test]
+    fn mirror_rows_keeps_alpha_in_place() {
+        let src = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        assert_eq!(mirror_rows(&src, 2, 1), vec![50, 60, 70, 80, 10, 20, 30, 40]);
     }
 
     /// 跟随判定:缺省允许,记进 off 的才不允许
