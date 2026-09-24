@@ -212,6 +212,42 @@ pub struct DataFile {
     /// (老 JSON 里还留着也无所谓:读的时候 serde 直接忽略,写盘时自然消失)。
     #[serde(default)]
     pub pet_speeds: std::collections::HashMap<String, f32>,
+    /// **关掉**的动画名(设置窗口里每行那个勾选框)。
+    ///
+    /// 存「关掉的」而不是「开着的」是故意的:以后往 `assets/pet/` 丢新素材,
+    /// 不用改存档它也自动参与轮播 —— 反过来存「开着的」,新素材加进来是关着的,
+    /// 用户还得自己去找出来打开。
+    #[serde(default)]
+    pub pet_anim_off: std::collections::HashSet<String>,
+    /// 动画的显示/轮播顺序(名字数组)。**空 = 按 `manifest.json` 的顺序**。
+    ///
+    /// 和 `pet_speeds` 一样带 serde default:老文件读出来是空,新字段不用迁移
+    /// (理由见上面 appearance 那条)。
+    #[serde(default)]
+    pub pet_anim_order: Vec<String>,
+    /// 跟随鼠标:鼠标静止一段时间后,宠物自己慢慢走过去(§40)。
+    ///
+    /// 存的是**总开关**;「哪些动画期间才允许跟随」见 `pet_follow_off`。
+    #[serde(default = "default_true")]
+    pub pet_follow: bool,
+    /// 鼠标要静止多少秒才出发(设置里一根 3~60 秒的滑杆)
+    #[serde(default = "default_follow_delay")]
+    pub pet_follow_delay: f32,
+    /// 走路速度**倍率**(1 = 基准 220 像素/秒)。和每个动画那根速度滑杆是同一个说法。
+    #[serde(default = "default_follow_speed")]
+    pub pet_follow_speed: f32,
+    /// **不允许跟随**的动画名。缺省 = 都允许 —— 和 `pet_anim_off` 同一个套路:
+    /// 新素材进来默认就能跟随,不用改存档。
+    #[serde(default)]
+    pub pet_follow_off: std::collections::HashSet<String>,
+}
+
+fn default_follow_delay() -> f32 {
+    10.0
+}
+
+fn default_follow_speed() -> f32 {
+    1.0
 }
 
 fn default_true() -> bool {
@@ -241,6 +277,15 @@ pub fn clamp_pet_size(v: f32) -> f32 {
 
 pub fn clamp_pet_speed(v: f32) -> f32 {
     if v.is_finite() { v.clamp(PET_SPEED_MIN, PET_SPEED_MAX) } else { PET_SPEED_DEFAULT }
+}
+
+/// 跟随鼠标:静止多久才出发(秒)。上限给到 60,再久就没人等得到了。
+pub const FOLLOW_DELAY_MIN: f32 = 3.0;
+pub const FOLLOW_DELAY_MAX: f32 = 60.0;
+pub const FOLLOW_DELAY_DEFAULT: f32 = 10.0;
+
+pub fn clamp_follow_delay(v: f32) -> f32 {
+    if v.is_finite() { v.clamp(FOLLOW_DELAY_MIN, FOLLOW_DELAY_MAX) } else { FOLLOW_DELAY_DEFAULT }
 }
 
 // ── AI 对话的接口配置 ────────────────────────────────────────────────

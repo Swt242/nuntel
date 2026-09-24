@@ -351,28 +351,71 @@ export component NotesWindow inherits Window {
         border-width: 1px;
         border-color: Theme.border;
 
-        md-input := ClipTextInput {
-            text <=> AppData.md-source;
-            width: parent.width - 20px;
-            height: parent.height - 16px;
-            x: 10px;
-            y: 8px;
-            // 等宽 + 多行:Markdown 源码用比例字体根本没法看对齐
-            font-family: "Consolas";
-            font-size: 13px;
-            color: Theme.text;
-            single-line: false;
-            wrap: word-wrap;
-            init => { self.focus(); }
+        // ⚠️ **源码这一栏必须包在 ScrollView 里。**
+        //
+        // 原来是把 TextInput 直接按面板高度摆死的(`height: parent.height - 16px`),
+        // 结果内容一长,超出部分既画不出来**也没法滚** —— 长笔记翻不到下面。
+        //
+        // Slint 的 `TextInput` **自己不滚动**,官方文档原话:「光标跑到可视区外时它不会
+        // 自动滚动,这是外面那层的责任」。所以给它一层 ScrollView,并且让输入框的高度
+        // **跟着内容长**(`preferred-height`),滚动条才有东西可滚。
+        md-edit-scroll := ScrollView {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            // 纵向滚动条留着(长笔记要看位置),横向关掉 —— 文字是折行的
+            horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+            // ⚠️ **`content-height` 必须显式给**:ScrollView **不会**自己从子元素推内容尺寸,
+            // 不给的话内容高就等于可视高 —— 看着有滚动条,其实没东西可滚。
+            // (这一整套写法是照 Slint 自带的 `TextEdit` 抄的:它内部就是 ScrollView +
+            //  `content-height: max(self.visible-height, text-input.preferred-height)`。)
+            content-width: self.visible-width;
+            content-height: max(self.visible-height, md-input.preferred-height + 16px);
 
-            // Ctrl+S 保存;只接管这一个,其余一律 false 交给 ClipTextInput 放行
-            // (不然编辑键/输入法/Shift+Insert 会被吃)
-            extra-key(ev) => {
-                if (ev.modifiers.control && (ev.text == "s" || ev.text == "S")) {
-                    Logic.md-save();
-                    true
-                } else {
-                    false
+            md-input := ClipTextInput {
+                text <=> AppData.md-source;
+                // 宽度用 `visible-width`(可视宽,不含滚动条),和预览那边同一个道理;
+                // 高度 = 内容高,**但至少铺满可视区** —— 短笔记时点击区域得够大
+                width: md-edit-scroll.visible-width - 20px;
+                height: max(self.preferred-height + 16px, md-edit-scroll.visible-height);
+                x: 10px;
+                y: 8px;
+                // 等宽 + 多行:Markdown 源码用比例字体根本没法看对齐
+                font-family: "Consolas";
+                font-size: 13px;
+                color: Theme.text;
+                single-line: false;
+                wrap: word-wrap;
+                init => { self.focus(); }
+
+                // 光标跑到可视区外时把视图推过去 —— Slint 的 TextInput **自己不会**
+                // 跟着光标滚(官方文档原话),官方 `TextEdit` 也是这么手写的,
+                // 下面这几个表达式就是从它那儿抄的(20px 那条是「光标下面留一行」)。
+                cursor-position-changed(cpos) => {
+                    if (cpos.y + md-edit-scroll.content-y < 0px) {
+                        md-edit-scroll.content-y = min(
+                            0px,
+                            md-edit-scroll.visible-height - cpos.y - 20px,
+                            max(md-edit-scroll.visible-height - self.height, -cpos.y),
+                        );
+                    } else if (cpos.y + md-edit-scroll.content-y > md-edit-scroll.visible-height - 20px) {
+                        md-edit-scroll.content-y = min(
+                            0px,
+                            max(md-edit-scroll.visible-height - self.height, md-edit-scroll.visible-height - cpos.y - 20px),
+                        );
+                    }
+                }
+
+                // Ctrl+S 保存;只接管这一个,其余一律 false 交给 ClipTextInput 放行
+                // (不然编辑键/输入法/Shift+Insert 会被吃)
+                extra-key(ev) => {
+                    if (ev.modifiers.control && (ev.text == "s" || ev.text == "S")) {
+                        Logic.md-save();
+                        true
+                    } else {
+                        false
+                    }
                 }
             }
         }

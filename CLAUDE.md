@@ -38,6 +38,16 @@ cargo test --release model::tests::badge_shows_overdue_and_relative_days
   所以要重建 exe 得先杀掉正在跑的那个,否则链接会因 exe 被占用失败。
 - 只想改样式不用编 Rust:`~/.slint-tools/slint-viewer.exe --check ui/app.slint`
   (`--load-data` 认不出跨文件 import 的 global,预览整窗口请直接跑程序)。
+- 桌宠动画的**顺序和开关**存在 `pet_anim_order` / `pet_anim_off` 里,**顺序就是待机轮播顺序**
+  (不再是随机;见 §39)。加素材后两边对不上的情况由 `pet::effective_order` 兜着。
+- 设置里那 10 行动画的**预览就是桌宠本人**(点 ☰ 当场演一遍,见 §41):所以那一列图标
+  有**两个手势** —— 点 = 试演、按着拖 = 排序。试演状态走的是 `AppData.pet-preview`
+  **这个单独的全局字符串属性**,不是 `PetAnim` 里的字段:改它不会重建 `for` 里的行,
+  因而不会把正在拖的手势打断(推列表的坑见 §39)。
+- **跟随鼠标**(§40)挪窗口走的是 `layout_pet_window` 那条老路,只是多了一个
+  `pet_target_center` 入口。⚠️ 走路**必须调 `layout_pet_window_forced()`** ——
+  尺寸不变,普通那条会被「没变就别动」的短路整个吞掉。
+
 - 让 AI 驱动运行中的界面做回归:
   `SLINT_EMIT_DEBUG_INFO=1 cargo build --features slint/mcp`,
   再 `SLINT_MCP_PORT=9315 ./target/release/nuntel.exe`,连 `http://localhost:9315/mcp`。
@@ -137,6 +147,15 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
   **都压不住**,得给那行布局加 `alignment: start`(代码块语法高亮那一轮踩的,§36)。
 - ⚠️ **Slint 的函数是「纯函数」语义**:读属性的函数不能在属性绑定里调
   (报 `Call of impure function`)。所以「类别 → 颜色」这类映射只能就地写三元链。
+- ⚠️ **要当布局子项的组件,根别用布局**:「以布局为根的组件」在父布局里量到的高度
+  **会少一行**(实测),表现是最后一行吊在框外。改成 `Rectangle` + 显式
+  `height: 里面那个布局.preferred-height`(§38;和 `MdBlockView` 那条「高度必须自己算」
+  是同一个道理)。
+- ⚠️ **`ScrollView` 不会自己从子元素推内容尺寸**:不显式写
+  `content-height: max(self.visible-height, 内容.preferred-height)` 就是「有滚动条但没
+  东西可滚」;而且 **`TextInput` 自己不跟着光标滚**,得手写 `cursor-position-changed`
+  把视图钳过去 —— 这两条照 Slint 自带的 `TextEdit` 抄(`widgets/common/textedit-base.slint`),
+  别自己试(§37)。
 - ⚠️ **`if ... :` 会插一层隐式父级**,里面的 `parent` 不再是本来的父元素 ——
   浮层那种要铺满窗口的元素,几何一律用 `root.` 写。
 - 压在桌面/其它窗口上的浮层用 `Theme.sheet`(几乎不透明),不能用透明底 ——
@@ -199,7 +218,7 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
 
 | 文件 | 内容 |
 |---|---|
-| `todos.json` | 待办 + 主题/外观/桌宠开关与尺寸与各动画速度,`version: 2` |
+| `todos.json` | 待办 + 主题/外观/桌宠开关与尺寸、各动画的速度/开关/顺序、跟随鼠标那几项,`version: 2` |
 | `notes\*.md` | Markdown 笔记库,一个文件一篇(老的单文件 `notes.md` 会在第一次打开笔记时自动搬进去) |
 | `ai.json` | `{ base_url, api_key, model }` —— **故意和 todos 分开存**,把 todos 发给别人时不会顺手带上密钥(明文存,没走凭据管理器) |
 | `nuntel.log` | 运行日志 |

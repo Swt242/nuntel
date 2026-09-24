@@ -221,6 +221,12 @@ export struct PetAnim {
     label: string,
     /// 速度倍率,1 = 素材原始速度
     speed: float,
+    /// 参不参与轮播(设置窗口里每行那个勾选框)。
+    /// **关掉的一律不播** —— 连「看书」「购物」这种交互动画也算(见 §39)
+    enabled: bool,
+    /// **在这个动画期间允许跟随鼠标**(§40)。缺省 = 允许。
+    /// 跟「轮播」那个开关是两件事:可以关掉轮播、但让它负责「走过去」
+    follow: bool,
 }
 
 /// 时刻选择器里的一个数字块(时或分)。
@@ -550,8 +556,21 @@ export global AppData {
     in property <image> pet-frame;
     /// 宠物显示边长(px)。范围见 Rust 侧的 PET_SIZE_MIN/MAX
     in property <float> pet-size: 112;
+    /// 跟随鼠标总开关 + 静止多久出发(秒)+ 走路速度倍率(§40)
+    in property <bool> pet-follow: true;
+    in property <float> pet-follow-delay: 10;
+    in property <float> pet-follow-speed: 1.0;
     /// 所有动画,每个带自己的速度倍率(设置窗口里一行一个滑杆)
     in property <[PetAnim]> pet-anims;
+    /// 设置窗口里正在「试演」的那一个动画名(空 = 没在试)。
+    ///
+    /// 设置页里不摆缩略图,靠**真桌宠**当预览:点那一行的 ☰,桌宠就当场
+    /// 按它自己的速度演一遍。这个字符串就是「现在演的是哪一行」,
+    /// 那一行据此高亮(见 settings.slint)。
+    ///
+    /// ⚠️ **它单独一个属性,不是 PetAnim 里的字段** —— 改它不会重建下面的列表,
+    /// 而点 ☰ 的同时很可能正按着在拖动,列表一重建手势就断了(§39 那条)。
+    in property <string> pet-preview;
 
     // ── AI 对话窗口 ──
     //
@@ -723,6 +742,22 @@ export global Logic {
     callback set-pet-size(float);
     /// 设置里调**某个**桌宠动画的速度(按动画名找回那一条)
     callback set-pet-anim-speed(string, float);
+    /// 勾上 / 勾掉某个动画。**关掉的一律不播**,连交互动画(看书/购物)也算
+    callback set-pet-anim-enabled(string, bool);
+    /// 拖动排序:把某个动画挪到第 N 位。**只在松手那一刻发** ——
+    /// 拖的过程中就推列表,`for` 会把正在拖的那一行重建掉(见 settings.slint 里那条注释)
+    callback move-pet-anim(string, int);
+    /// 跟随鼠标的总开关(§40)
+    callback set-pet-follow(bool);
+    /// 鼠标静止多少秒才出发
+    callback set-pet-follow-delay(float);
+    /// 走路速度倍率
+    callback set-pet-follow-speed(float);
+    /// 某个动画期间允不允许跟随
+    callback set-pet-follow-anim(string, bool);
+    /// 让桌宠**当场演一遍**这个动画(设置窗口里点那一行的 ☰)。
+    /// 再点同一个 = 收工;关设置窗口也会收工。放着不管它会一直循环
+    callback preview-pet-anim(string);
 
     // ── AI 对话 ──
     /// 发一条消息(参数是输入框里的原文)
@@ -1152,6 +1187,12 @@ export component Slider inherits Rectangle {
     /// 语法关键字撞名,读起来也含混。
     callback moved-to(float);
 
+    /// 灰掉(关掉的动画那一行用)。
+    ///
+    /// **只是变暗 + 不响应鼠标**,不是真禁用:值还能从外面改,也不影响存盘 ——
+    /// 这里的语义是「这个动画现在不参与轮播,但速度还是先存着」。
+    in property <bool> enabled: true;
+
     /// 滑块直径
     property <length> knob-size: 14px;
     /// 已经划过的那一段占的比例(0..1)
@@ -1186,7 +1227,7 @@ export component Slider inherits Rectangle {
         width: 6px + (parent.width - 12px) * root.ratio;
         y: (parent.height - self.height) / 2;
         border-radius: 2px * Theme.radius-scale;
-        background: Theme.accent;
+        background: root.enabled ? Theme.accent : Theme.text-dim;
     }
 
     // 滑块。**必须留出半径的行程**,否则两端会被裁掉半截。
@@ -1196,9 +1237,9 @@ export component Slider inherits Rectangle {
         x: (parent.width - root.knob-size) * root.ratio;
         y: (parent.height - self.height) / 2;
         border-radius: (root.knob-size / 2) * Theme.radius-scale;
-        background: Theme.card;
+        background: root.enabled ? Theme.card : Theme.inset;
         border-width: 2px;
-        border-color: Theme.accent-ink;
+        border-color: root.enabled ? Theme.accent-ink : Theme.text-dim;
         drop-shadow-color: Theme.shadow;
         drop-shadow-blur: 4px;
     }
@@ -1210,7 +1251,9 @@ export component Slider inherits Rectangle {
         // `touch.width` 也不是轨道宽度 —— 一拖值就飞。
         width: parent.width;
         height: parent.height;
-        mouse-cursor: pointer;
+        // 灰掉的滑杆不响应拖动(值仍然可以由宿主改)
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
 
         // `pressed` 是 out 属性,没有 pressed 回调 —— 只能监听它的变化
         // (按下和抬起都会触发),所以里面要判一下当前是不是按着。

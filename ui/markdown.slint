@@ -12,34 +12,49 @@ import { MdBlock, MdCell, MdCodeSpan, MdKind, Theme, TodoCheck, VCenter } from "
 /// ⚠️ 为什么单独拆成一个组件:**Slint 不支持行内嵌套的 `for`**
 /// (`for a in x : for b in y : ...` 直接语法错),而高亮结果天生是二维的
 /// (行 → 段)。拆一层组件、每层只留一个 `for`,就绕过去了。
-component MdCodeLineView inherits HorizontalLayout {
+component MdCodeLineView inherits Rectangle {
     in property <[MdCodeSpan]> spans;
 
-    spacing: 0;
-    // ⚠️ **`alignment: start` 是必须的,别删。**
+    background: transparent;
+    // ⚠️ **高度自己报**,不能让它是个「以布局为根」的组件。
     //
-    // Slint 的布局**默认会把多余的宽度平分给各个子项**(不是 `spacing` 的事,
-    // 也不是 `horizontal-stretch: 0` 压得住的 —— 两个都试过,没用)。一行代码拆成
-    // 几十段之后,这些「平分出来的空隙」就变成满屏的缝:`pub   fn   main () ->   Result <>`,
-    // 一眼就看得出不对,但特别容易误判成字体或字距问题。
-    // 压成 start 之后,各段按自己的宽度挨着排,和整行一个 Text 渲染出来一模一样。
-    alignment: start;
+    // 实测:把 `inherits HorizontalLayout` 的组件当 VerticalLayout 的子项时,
+    // 外层量到的高度会**少一行** —— 代码块最后一行就吊在框外面(§38)。
+    // 换成普通 Rectangle + 显式高度(和本文件里 MdBlockView 一个套路:
+    // 「高度必须自己算,布局问它要多少它答不上来时只会给 0」),父布局拿到的是
+    // 一个确定的数,就不再有这回事。
+    height: line-layout.preferred-height;
 
-    for sp in spans : Text {
-        text: sp.text;
-        font-family: "Consolas";
-        font-size: 12px;
-        // 类别 → 主题色。**直接写三元链、不抽函数**:Slint 的函数是纯函数语义,
-        // 读属性的那种会被判成 impure,绑定里调不了(见 widgets.slint 那段注释)。
-        // 颜色字面量一个都不许出现在这儿 —— 配色令牌在 Theme 里派生
-        color: sp.class == 1 ? Theme.code-keyword
-            : sp.class == 2 ? Theme.code-string
-            : sp.class == 3 ? Theme.code-comment
-            : sp.class == 4 ? Theme.code-number
-            : sp.class == 5 ? Theme.code-function
-            : sp.class == 6 ? Theme.code-type
-            : Theme.text;
-        wrap: no-wrap;
+    line-layout := HorizontalLayout {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        spacing: 0;
+        // ⚠️ **`alignment: start` 是必须的,别删。**
+        //
+        // Slint 的布局**默认会把多余的宽度平分给各个子项**(不是 `spacing` 的事,
+        // 也不是 `horizontal-stretch: 0` 压得住的 —— 两个都试过,没用)。一行代码拆成
+        // 几十段之后,这些「平分出来的空隙」就变成满屏的缝:`pub   fn   main () ->   Result <>`,
+        // 一眼就看得出不对,但特别容易误判成字体或字距问题。
+        // 压成 start 之后,各段按自己的宽度挨着排,和整行一个 Text 渲染出来一模一样。
+        alignment: start;
+
+        for sp in spans : Text {
+            text: sp.text;
+            font-family: "Consolas";
+            font-size: 12px;
+            // 类别 → 主题色。**直接写三元链、不抽函数**:Slint 的函数是纯函数语义,
+            // 读属性的那种会被判成 impure,绑定里调不了(见 widgets.slint 那段注释)。
+            // 颜色字面量一个都不许出现在这儿 —— 配色令牌在 Theme 里派生
+            color: sp.class == 1 ? Theme.code-keyword
+                : sp.class == 2 ? Theme.code-string
+                : sp.class == 3 ? Theme.code-comment
+                : sp.class == 4 ? Theme.code-number
+                : sp.class == 5 ? Theme.code-function
+                : sp.class == 6 ? Theme.code-type
+                : Theme.text;
+            wrap: no-wrap;
+        }
     }
 }
 

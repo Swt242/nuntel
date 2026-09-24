@@ -185,6 +185,16 @@ fn ring_band(open: bool) -> f32 {
 const PET_IDLE_DWELL: Duration = Duration::from_secs(8);
 const PET_IDLE_JITTER_MS: u64 = 7000;
 
+/// 跟随鼠标:走到光标**下方**多少像素停下(逻辑像素)。
+///
+/// 宠物是贴底摆的,所以「停下来」指的是它的**脚**落在这个位置 —— 光标不会被宠物盖住。
+const FOLLOW_GAP: f32 = 30.0;
+/// 目标离宠物中心不到这个距离就不走了(逻辑像素)。
+///
+/// 有它才不会出现「光标一直停在宠物身上,于是每隔 N 秒原地走一次」——
+/// 原地起步那一下会不停重播动画。
+const FOLLOW_MIN_DIST: f32 = 40.0;
+
 /// 动画名的中文标签(设置窗口里显示)。**这是唯一需要人工维护的一张表** ——
 /// 名字本身来自 `assets/pet/manifest.json`,这里只是给人看的说法。
 /// 没配到的名字直接显示原名,所以加了新素材也不会漏。
@@ -450,11 +460,40 @@ struct State {
     pet_size: Cell<f32>,
     /// 桌宠动画速度倍率,**每个动画一份**(名字 → 倍率;没有的按 1.0)。
     pet_speeds: RefCell<std::collections::HashMap<String, f32>>,
+    /// **关掉**的动画名。关掉的一律不播 —— 待机轮播跳过它,交互动画(看书/购物)
+    /// 也不切过去(「关掉看书」的意思就是不想让它出现,见 §39)。
+    pet_anim_off: RefCell<std::collections::HashSet<String>>,
+    /// 动画顺序(名字数组)。**空 = manifest 顺序**;同时决定待机轮播的顺序。
+    /// 和素材清单对不上的情况由 `pet::effective_order` 消化。
+    pet_anim_order: RefCell<Vec<String>>,
+    /// 跟随鼠标的总开关
+    pet_follow: Cell<bool>,
+    /// 跟随鼠标:鼠标静止多少秒才出发(秒,3~60)
+    pet_follow_delay: Cell<f32>,
+    /// 跟随走路的速度倍率(1 = 基准 220 像素/秒)
+    pet_follow_speed: Cell<f32>,
+    /// **不允许跟随**的动画名(缺省 = 都允许)
+    pet_follow_off: RefCell<std::collections::HashSet<String>>,
+    /// 上一帧看到的光标位置(判断「静止了多久」用)
+    pet_cursor: Cell<(i32, i32)>,
+    /// 光标是从什么时候开始不动的
+    pet_cursor_still: Cell<Instant>,
+    /// 正在「走过去」的路线 + 出发时刻;不在走就是 None
+    pet_walk: Cell<Option<(pet::Walk, Instant)>>,
+    /// 走的时候把窗口摆到**这个宠物中心**(物理像素)。不在走就是 None ——
+    /// 窗口几何只认这一个额外输入,其余仍然走原来那套「中心反推」
+    pet_target_center: Cell<Option<(f32, f32)>>,
+    /// 设置窗口里正在**试演**哪个动画(点了那一行的 ☰)。
+    ///
+    /// 设置页里没有缩略图,预览就是**真桌宠本人**:点一下 ☰,它当场按自己那条
+    /// 速度演一遍(所以拖速度滑杆能当场看出快慢),一直循环到你点别的行、
+    /// 再点同一个、或者把设置窗口关掉。
+    pet_preview: RefCell<Option<String>>,
     /// 当前是不是在「待机轮播」状态。交互动画(看书/购物…)只播一轮就回到待机。
     pet_idle: Cell<bool>,
     /// 待机时,**最早什么时候可以换下一个动画**(见 PET_IDLE_DWELL)
     pet_idle_until: Cell<Instant>,
-    /// xorshift 的种子,用来挑下一个待机动画
+    /// xorshift 的种子。顺序轮播之后基本只剩「抖动」在用(见 `rotate_pet_idle`)
     pet_rng: Cell<u64>,
     /// 桌宠窗口上一次算出来的高度。只有它变了才动窗口 ——
     /// 不然每次同步都 set_position,用户拖着的时候会被拽回去。
@@ -800,6 +839,12 @@ impl State {
             show_pet: self.show_pet.get(),
             pet_size: self.pet_size.get(),
             pet_speeds: self.pet_speeds.borrow().clone(),
+            pet_anim_off: self.pet_anim_off.borrow().clone(),
+            pet_anim_order: self.pet_anim_order.borrow().clone(),
+            pet_follow: self.pet_follow.get(),
+            pet_follow_delay: self.pet_follow_delay.get(),
+            pet_follow_speed: self.pet_follow_speed.get(),
+            pet_follow_off: self.pet_follow_off.borrow().clone(),
         };
         if let Err(err) = model::save(&self.path, &data) {
             platform::log(&format!("保存待办失败: {err}"));
@@ -1030,6 +1075,9 @@ impl State {
         if let Some(settings) = settings {
             let _ = settings.hide();
         }
+        // 试演是「在设置窗口里看」的东西 —— 窗口一关就还它自由,
+        // 不然桌宠会一直钉在那个动画上循环(下一行那行高亮也没人看得见了)。
+        self.end_pet_preview();
     }
 
     // ── 视图与日历 ────────────────────────────────────────────────────
@@ -1522,6 +1570,107 @@ impl State {
     ///
     /// 全用**物理**像素比:指针是系统的物理坐标,窗口位置/尺寸也是物理的,
     /// 而 pet-size 是逻辑的(高 DPI 上要乘缩放,不然判定区会小一圈)。
+    /// 跟随鼠标:鼠标静止够久了,宠物慢慢走过去(§40)。
+    ///
+    /// 挂在 40ms 的动画心跳上(`tick_pet` 里 `tick_pet_ring` 之后 —— 那时已经确认过
+    /// 窗口可见,不可见时这段自然不跑)。
+    ///
+    /// 几条刻意的规矩:
+    /// - **目标在出发那一刻定死**,中途鼠标再动也继续走到原目标(「非实时」的语义);
+    /// - **走过去不换动画**,接着播它当时那个,只是把轮播锁住;
+    /// - **用户一拖就中止**(见 `pet_drag_begin`),不跟人抢;
+    /// - 忙的时候(输入条/环/气泡/拖拽)不出发。
+    fn tick_pet_follow(&self) {
+        let Some(pet) = self.pet.borrow().clone() else { return };
+        let now = Instant::now();
+
+        // ── 1. 光标动没动(2px 以内算手抖)──
+        let cursor = platform::cursor_pos();
+        let last = self.pet_cursor.get();
+        if (cursor.0 - last.0).abs() > 2 || (cursor.1 - last.1).abs() > 2 {
+            self.pet_cursor.set(cursor);
+            self.pet_cursor_still.set(now);
+        }
+
+        // ── 2. 正在走:按曲线挪窗口 ──
+        if let Some((walk, started)) = self.pet_walk.get() {
+            let t = now.duration_since(started).as_secs_f32() / walk.secs.max(0.01);
+            if t >= 1.0 {
+                // 最后一步落准(别差几像素),然后回待机轮播
+                self.pet_target_center.set(Some(walk.to));
+                self.layout_pet_window_forced();
+                self.pet_walk.set(None);
+                self.pet_target_center.set(None);
+                self.back_to_idle();
+                return;
+            }
+            self.pet_target_center.set(Some(pet::curve_point(&walk, t)));
+            // ⚠️ 必须走 forced:尺寸没变,普通那条会被「没变就别动」的短路挡掉
+            self.layout_pet_window_forced();
+            return;
+        }
+
+        // ── 3. 没在走:够条件才出发 ──
+        if !self.pet_follow.get() {
+            return;
+        }
+        if now.duration_since(self.pet_cursor_still.get()).as_secs_f32()
+            < self.pet_follow_delay.get()
+        {
+            return;
+        }
+        // 忙的时候不打扰 —— 判据和悬停那一圈是同一套。
+        // **试演也算忙**:设置窗口里点着某一行动画看,宠物忽然自己走开
+        // 就成了「边走边演」,想看清楚的东西全跑了。
+        if self.pet_drag.get().is_some()
+            || self.pet_adding.get()
+            || self.pet_ring.get()
+            || !self.pet_bubble().is_empty()
+            || self.pet_preview.borrow().is_some()
+        {
+            return;
+        }
+        // 「什么动画下才允许跟随」
+        let current = self.pet_frames.names().get(self.pet_anim.get().0).copied().unwrap_or("");
+        if !pet::follow_allowed(&self.pet_follow_off.borrow(), current) {
+            return;
+        }
+
+        // 目标:光标下方 FOLLOW_GAP(逻辑像素 → 物理)
+        let scale = pet.window().scale_factor() as f32;
+        let target = (cursor.0 as f32, cursor.1 as f32 + FOLLOW_GAP * scale);
+
+        // 宠物中心(物理):和 `pet_hover` 同一个算法
+        let size = pet.window().size();
+        let pos = pet.window().position();
+        let pet_px = self.pet_size.get() * scale;
+        let from = (
+            pos.x as f32 + size.width as f32 / 2.0,
+            pos.y as f32 + size.height as f32 - pet_px / 2.0,
+        );
+        let (dx, dy) = (target.0 - from.0, target.1 - from.1);
+        if (dx * dx + dy * dy).sqrt() < FOLLOW_MIN_DIST * scale {
+            return; // 已经在旁边了,别原地「走」
+        }
+
+        // 往哪边拱由这个随机数定(左右交替)
+        let mut seed = self.pet_rng.get();
+        let dir = next_rand(&mut seed);
+        self.pet_rng.set(seed);
+        let walk = pet::walk_curve(from, target, self.pet_follow_speed.get(), dir);
+
+        // 锁住当前动画:走路期间不轮换(照 rotate_pet_idle 末尾那套)。
+        // 从头播一遍,看着像「起步」。
+        if self.pet_frames.index_of(current).is_some() {
+            self.play_pet_anim(current);
+        }
+        self.pet_idle.set(true);
+        self.pet_idle_until.set(
+            now + Duration::from_secs_f32(walk.secs) + Duration::from_millis(500),
+        );
+        self.pet_walk.set(Some((walk, now)));
+    }
+
     fn pet_hover(&self, pet: &PetWindow) -> (bool, bool) {
         let scale = pet.window().scale_factor() as f32;
         let pet_px = self.pet_size.get() * scale;
@@ -1577,6 +1726,8 @@ impl State {
         }
         // 顺带看一眼鼠标(放在动画逻辑前面:那段有可能提前 return)
         self.tick_pet_ring();
+        // 跟随鼠标:静止够久了就走过去(和上面共用这一次心跳)
+        self.tick_pet_follow();
 
         let (anim, frame) = self.pet_anim.get();
         let count = self.pet_frames.frame_count(anim);
@@ -1627,6 +1778,16 @@ impl State {
     /// - **待机动画**:住够 `PET_IDLE_DWELL` 就随机换一个别的 ——
     ///   素材里有 8 个待机,不轮播的话另外 7 个永远见不到。
     fn pet_finished_loop(&self) {
+        // **试演中:一直重播这一个**(不轮换、也不停)。设置窗口里点一下 ☰ 就是
+        // 「让我看清楚它长什么样」,看多久由你 —— 看够了再点一下 ☰,或者关掉设置窗口。
+        //
+        // 放在最前面:试演时 `pet_idle` 还是 true,不拦的话住够 PET_IDLE_DWELL
+        // 就自己换走了。
+        let preview = self.pet_preview.borrow().clone();
+        if let Some(name) = preview.as_deref() {
+            self.play_pet_anim(name);
+            return;
+        }
         if !self.pet_idle.get() {
             self.rotate_pet_idle();
             return;
@@ -1638,23 +1799,31 @@ impl State {
     }
 
     /// 随机换到另一个待机动画(不连着播同一个)。
+    /// 换下一个待机动画。
+    ///
+    /// **按设置里的顺序一个个走**(顺序就是设置窗口里拖出来的那个),关掉的跳过,
+    /// 走到末尾绕回开头 —— 想回到「随便播」的话,不拖它就行(顺序 = manifest 顺序)。
+    /// 顺序固定,但每个动画「住」多久仍然带随机抖动(`PET_IDLE_JITTER_MS`),
+    /// 所以不会变成节拍器。
     fn rotate_pet_idle(&self) {
-        let all = self.pet_frames.idle_names();
-        if all.is_empty() {
-            return;
-        }
-        let current_name = self.pet_frames.names().get(self.pet_anim.get().0).copied();
-        // 候选里排掉正在播的那个;只剩一个的话就还播它
-        let others: Vec<&str> = all.iter().copied().filter(|n| Some(*n) != current_name).collect();
-        let pool = if others.is_empty() { all } else { others };
+        // 「哪些算待机动画」由 `PetFrames::idle_names` 说了算(`idle-` 前缀那条规则
+        // 只在 pet.rs 里写一份),这里只负责按顺序过滤 + 跳过关掉的
+        let idle = self.pet_frames.idle_names();
+        let pool: Vec<&str> = self
+            .anim_order()
+            .into_iter()
+            .filter(|n| idle.contains(n) && self.pet_anim_enabled(n))
+            .collect();
+        let current = self.pet_frames.names().get(self.pet_anim.get().0).copied();
+        // 一个待机动画都没开(或者素材里就没有 idle):什么都别做,停在当前这个上
+        let Some(next) = pet::next_in_cycle(&pool, current) else { return };
 
+        // 只摇一次,只剩「抖动」在用 —— 换哪个不再是随机
         let mut seed = self.pet_rng.get();
-        let pick = (next_rand(&mut seed) % pool.len() as u64) as usize;
-        // 再摇一次当抖动,免得换动画的节奏像节拍器
         let jitter = next_rand(&mut seed) % PET_IDLE_JITTER_MS;
         self.pet_rng.set(seed);
 
-        self.play_pet_anim(pool[pick]);
+        self.play_pet_anim(next);
         self.pet_idle.set(true);
         self.pet_idle_until
             .set(Instant::now() + PET_IDLE_DWELL + Duration::from_millis(jitter));
@@ -1675,8 +1844,64 @@ impl State {
         if self.pet_frames.index_of(name).is_none() {
             return; // 素材里没有就静默跳过(删了素材也不该崩)
         }
+        if !self.pet_anim_enabled(name) {
+            // 设置里关掉的动画一律不播 —— **交互动画也算**:
+            // 「关掉看书」的意思就是不想让它出现,聊天时就不该切过去(见 §39)
+            return;
+        }
+        // 交互一来试演就收工 —— 不收的话设置窗口那行还亮着「正在演」,
+        // 而桌宠早演别的去了(而且 `pet_finished_loop` 会把这个交互动画
+        // 也当成试演对象循环下去)。这里只清状态,下面紧接着就播这个 cue。
+        self.clear_pet_preview();
         self.pet_idle.set(false);
         self.play_pet_anim(name);
+    }
+
+    // ── 试演(设置窗口里点 ☰)────────────────────────────────────────
+    //
+    // 设置页里**不摆缩略图**:预览就是桌宠本人 —— 点那一行的 ☰,它当场按这一行
+    // 自己的速度演一遍。好处是不用改设置窗口的布局(那个高度是写死的),
+    // 而且看到的就是实际效果、实际大小、实际速度。
+
+    /// 设置窗口:点某个动画的 ☰。同一个再点一次就收工。
+    fn set_pet_preview(&self, name: &str) {
+        let same = self.pet_preview.borrow().as_deref() == Some(name);
+        if same || self.pet_frames.index_of(name).is_none() {
+            self.end_pet_preview();
+            return;
+        }
+        *self.pet_preview.borrow_mut() = Some(name.to_string());
+        self.push_pet_preview();
+        // 从第 0 帧起播(每次都从头,点一下就知道「这就是它的开头」)。
+        // **不看 `enabled`**:关掉轮播的动画照样能试演 —— 不然你没法先看看它是什么样。
+        self.play_pet_anim(name);
+        self.pet_idle.set(true); // 让 `pet_finished_loop` 走「循环」那条
+    }
+
+    /// 收工:不再试演,回待机轮播。
+    fn end_pet_preview(&self) {
+        if self.pet_preview.borrow_mut().take().is_none() {
+            return; // 本来就没在演,别白折腾一次待机轮播
+        }
+        self.push_pet_preview();
+        self.back_to_idle();
+    }
+
+    /// 只清状态(高亮跟着灭),**不碰当前动画** —— 给「马上要播别的动画」那条路用。
+    fn clear_pet_preview(&self) {
+        if self.pet_preview.borrow_mut().take().is_some() {
+            self.push_pet_preview();
+        }
+    }
+
+    /// 把「正在试演哪一个」推给设置窗口(那一行要亮起来)。
+    ///
+    /// **只推这一个字符串,不推整个动画列表** —— 推列表会把 `for` 里的行重建,
+    /// 而点 ☰ 的同时很可能正按着在拖动,行一重建手势就断了(见 §39)。
+    fn push_pet_preview(&self) {
+        let Some(settings) = self.settings.borrow().clone() else { return };
+        let name = self.pet_preview.borrow().clone().unwrap_or_default();
+        settings.global::<AppData>().set_pet_preview(name.into());
     }
 
     // ── 拖桌宠 ────────────────────────────────────────────────────────
@@ -1693,6 +1918,9 @@ impl State {
     /// 宠物会跳一下(实测能差 20px)。
     fn pet_drag_begin(&self, mouse_x: f32, mouse_y: f32) {
         let Some(pet) = self.pet.borrow().clone() else { return };
+        // 用户一上手就中止「跟随走路」—— 他要把宠物拖到别处,别跟它抢窗口
+        self.pet_walk.set(None);
+        self.pet_target_center.set(None);
         let pos = pet.window().position();
         let cursor0 = (pos.x + mouse_x.round() as i32, pos.y + mouse_y.round() as i32);
         self.pet_drag.set(Some((cursor0, (pos.x, pos.y))));
@@ -2565,16 +2793,122 @@ impl State {
     fn push_pet_anims(&self) {
         let Some(settings) = self.settings.borrow().clone() else { return };
         let anims: Vec<PetAnim> = self
-            .pet_frames
-            .names()
+            .anim_order()
             .into_iter()
             .map(|name| PetAnim {
                 name: name.into(),
                 label: pet_anim_label(name).as_str().into(),
                 speed: self.pet_anim_speed(name),
+                enabled: self.pet_anim_enabled(name),
+                follow: self.pet_follow_allowed(name),
             })
             .collect();
         settings.global::<AppData>().set_pet_anims(ModelRc::from(Rc::new(VecModel::from(anims))));
+    }
+
+    /// 真正要用的动画顺序:存档里排过的在前,新素材按素材清单的顺序补在后面。
+    ///
+    /// 两边对不上的情况全交给 `pet::effective_order` 处理(纯函数,有单测)。
+    fn anim_order(&self) -> Vec<&'static str> {
+        pet::effective_order(&self.pet_anim_order.borrow(), &self.pet_frames.names())
+    }
+
+    /// 这个动画开着吗(没记过 = 开着 —— 新素材默认参与轮播)
+    fn pet_anim_enabled(&self, name: &str) -> bool {
+        !self.pet_anim_off.borrow().contains(name)
+    }
+
+    /// 这个动画期间允许跟随吗(没记过 = 允许 —— 新素材默认能跟随)
+    fn pet_follow_allowed(&self, name: &str) -> bool {
+        pet::follow_allowed(&self.pet_follow_off.borrow(), name)
+    }
+
+    /// 设置窗口:跟随总开关
+    fn set_pet_follow(&self, on: bool) {
+        if self.pet_follow.get() == on {
+            return;
+        }
+        self.pet_follow.set(on);
+        if !on {
+            // 关掉的时候把正在走的那一趟也停掉,不然关完它还在半路上
+            self.pet_walk.set(None);
+            self.pet_target_center.set(None);
+        }
+        self.save();
+        self.push_pet_settings(); // 勾选框和下面两根滑杆的灰态都要立刻回显
+    }
+
+    /// 设置窗口:静止多久才出发(秒)
+    fn set_pet_follow_delay(&self, secs: f32) {
+        let secs = model::clamp_follow_delay(secs);
+        if (self.pet_follow_delay.get() - secs).abs() < 0.01 {
+            return;
+        }
+        self.pet_follow_delay.set(secs);
+        self.save();
+        self.push_pet_settings();
+    }
+
+    /// 设置窗口:走路速度倍率
+    fn set_pet_follow_speed(&self, value: f32) {
+        let value = model::clamp_pet_speed(value);
+        if (self.pet_follow_speed.get() - value).abs() < 0.001 {
+            return;
+        }
+        self.pet_follow_speed.set(value);
+        self.save();
+        self.push_pet_settings();
+    }
+
+    /// 设置窗口:某个动画期间允不允许跟随。
+    ///
+    /// **要推回列表**(勾选框读的是模型里那个 `follow`),和 `set_pet_anim_enabled`
+    /// 是同一个道理 —— 见 §39 那张「推不推」的对照表。
+    fn set_pet_follow_anim(&self, name: &str, allowed: bool) {
+        {
+            let mut off = self.pet_follow_off.borrow_mut();
+            if allowed {
+                off.remove(name);
+            } else {
+                off.insert(name.to_string());
+            }
+        }
+        self.save();
+        self.push_pet_anims();
+    }
+
+    /// 设置窗口里勾掉 / 勾上某个动画。
+    ///
+    /// **必须把列表推回去**:勾选框的 `checked` 读的是推过去那份模型里的 `enabled`,
+    /// 不推的话界面上勾子不会变(踩过)。
+    ///
+    /// 和拖动不一样:拖动**不能**中途推 —— 那会把正在拖的那一行重建掉、手势当场断
+    /// (见 `move_pet_anim` 和 ui/settings.slint 里那条注释)。勾选是「点一下就完事」
+    /// 的操作,重建一行无所谓。
+    fn set_pet_anim_enabled(&self, name: &str, enabled: bool) {
+        {
+            let mut off = self.pet_anim_off.borrow_mut();
+            if enabled {
+                off.remove(name);
+            } else {
+                off.insert(name.to_string());
+            }
+        }
+        self.save();
+        self.push_pet_anims();
+    }
+
+    /// 拖动排序:把 `name` 挪到第 `to` 位。**只在松手那一刻调**(拖动过程纯视觉,
+    /// 中途推列表会把正在拖的那一行重建掉)。
+    fn move_pet_anim(&self, name: &str, to: usize) {
+        let order: Vec<String> = self.anim_order().into_iter().map(|s| s.to_string()).collect();
+        let moved = pet::move_in_order(&order, name, to);
+        if moved == order {
+            return; // 原地没动就别白写一次盘
+        }
+        *self.pet_anim_order.borrow_mut() = moved;
+        self.save();
+        self.push_pet_anims();
     }
 
     /// 把桌宠参数推给**设置窗口**那份 AppData(滑杆要显示当前值)。
@@ -2585,7 +2919,11 @@ impl State {
         let Some(settings) = self.settings.borrow().clone() else { return };
         let app = settings.global::<AppData>();
         app.set_pet_size(self.pet_size.get());
+        app.set_pet_follow(self.pet_follow.get());
+        app.set_pet_follow_delay(self.pet_follow_delay.get());
+        app.set_pet_follow_speed(self.pet_follow_speed.get());
         self.push_pet_anims();
+        self.push_pet_preview();
     }
 
     /// 换个动画播(从第 0 帧起)
@@ -2676,7 +3014,13 @@ impl State {
         //   的地方,而且再也下不来)。
         let first = old_h <= 0.0;
         let live = platform::window_rect(platform::PET_TITLE);
-        let (cx, cy) = match live {
+        // ⚠️ **跟随走路时由外面指定中心**(`pet_target_center`,物理像素),其余情况一律
+        // 从当前位置反推。这是唯一一个额外的入口 —— 别在别处加「直接 set_position」那种
+        // 捷径:那条路会绕过「底边 = 宠物脚」的一致性,宠物会一点点飘走(见 §32.3)。
+        let (cx, cy) = if let Some(target) = self.pet_target_center.get() {
+            target
+        } else {
+            match live {
             Some((x, y, lw, _)) => {
                 (x as f32 + lw as f32 / 2.0, y as f32 + old_h * scale - pet_px / 2.0)
             }
@@ -2700,6 +3044,7 @@ impl State {
                     (wx + ww) as f32 - margin - w * scale / 2.0,
                     (wy + wh) as f32 - margin - pet_px / 2.0,
                 )
+            }
             }
         };
         self.pet_h.set(h);
@@ -3732,7 +4077,18 @@ fn main() -> Result<(), slint::PlatformError> {
                 .map(|(k, v)| (k.clone(), model::clamp_pet_speed(*v)))
                 .collect(),
         ),
+        pet_anim_off: RefCell::new(data.pet_anim_off.clone()),
+        pet_anim_order: RefCell::new(data.pet_anim_order.clone()),
+        pet_follow: Cell::new(data.pet_follow),
+        pet_follow_delay: Cell::new(model::clamp_follow_delay(data.pet_follow_delay)),
+        pet_follow_speed: Cell::new(model::clamp_pet_speed(data.pet_follow_speed)),
+        pet_follow_off: RefCell::new(data.pet_follow_off.clone()),
+        pet_cursor: Cell::new(platform::cursor_pos()),
+        pet_cursor_still: Cell::new(Instant::now()),
+        pet_walk: Cell::new(None),
+        pet_target_center: Cell::new(None),
         pet_idle: Cell::new(true),
+        pet_preview: RefCell::new(None),
         pet_idle_until: Cell::new(Instant::now()),
         pet_rng: Cell::new(
             std::time::SystemTime::now()
@@ -3990,10 +4346,52 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             {
                 let s = state.clone();
+                settings.global::<Logic>()
+                    .on_set_pet_anim_enabled(move |name, on| s.set_pet_anim_enabled(&name, on));
+            }
+            {
+                let s = state.clone();
+                settings.global::<Logic>()
+                    .on_move_pet_anim(move |name, to| s.move_pet_anim(&name, to.max(0) as usize));
+            }
+            {
+                let s = state.clone();
+                settings.global::<Logic>().on_set_pet_follow(move |on| s.set_pet_follow(on));
+            }
+            {
+                let s = state.clone();
+                settings.global::<Logic>()
+                    .on_set_pet_follow_delay(move |secs| s.set_pet_follow_delay(secs));
+            }
+            {
+                let s = state.clone();
+                settings.global::<Logic>()
+                    .on_set_pet_follow_speed(move |v| s.set_pet_follow_speed(v));
+            }
+            {
+                let s = state.clone();
+                settings.global::<Logic>()
+                    .on_set_pet_follow_anim(move |name, on| s.set_pet_follow_anim(&name, on));
+            }
+            {
+                let s = state.clone();
+                settings.global::<Logic>()
+                    .on_preview_pet_anim(move |name| s.set_pet_preview(&name));
+            }
+            {
+                let s = state.clone();
                 settings.global::<Logic>().on_close_settings(move || s.close_settings());
             }
             // 设置窗口自己也可能被关掉(点它的 ✕,或者 Alt+F4)
-            settings.window().on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+            {
+                let s = state.clone();
+                settings.window().on_close_requested(move || {
+                    // Alt+F4 / 系统那条路**不经过** `close_settings`,试演状态
+                    // 得在这儿也收掉 —— 不然桌宠会一直钉在那个动画上循环。
+                    s.end_pet_preview();
+                    slint::CloseRequestResponse::HideWindow
+                });
+            }
             *state.settings.borrow_mut() = Some(Rc::new(settings));
         }
         Err(err) => {

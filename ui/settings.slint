@@ -10,7 +10,7 @@
 
 import {
     AppData, Appearance, Backdrop, Chip, PanelEdge, Logic, Slider, Theme, ThemePreference,
-    Toggle, VCenter, WindowButton,
+    TodoCheck, Toggle, VCenter, WindowButton,
 } from "widgets.slint";
 
 /// 外观预览小图。
@@ -208,13 +208,25 @@ export component SettingsWindow inherits Window {
     // 宽度按三张外观卡排得下来定的:(520 - 2×16 内边距 - 2×12 间距) / 3 ≈ 154。
     width: 520px;
     // 高度按内容量出来的:外观三张卡 + 亮暗一行 + 启动一行 + 桌宠大小
-    // + 10 个动画各一行滑杆。
+    // + 跟随那三行(开关/静止多久/速度)+ 动画列表的列头 + 10 个动画各一行。
     // 加动画(往 assets/pet 里丢素材)或加一节都要跟着加高 —— 布局不会自己撑开窗口。
-    height: 842px;
+    height: 970px;
     background: Theme.bg;
     no-frame: true;
     icon: @image-url("icons/app.svg");
     default-font-size: 14px;
+
+    // ── 拖动排序的状态(见下面动画列表那段说明)──
+    //
+    // 拖的过程**纯视觉**:模型一个字都不动,松手那一刻才发 `move-pet-anim`。
+    private property <string> drag-name: "";
+    private property <int> drag-from: -1;
+    /// 松手会落在第几位(拖动中实时算)
+    private property <int> drag-to: -1;
+    /// 按下时指针的**绝对** y
+    private property <length> drag-y0: 0px;
+    /// 一行占多高 = 行高 22 + 列表 spacing 4。**改行高就得改这里**
+    private property <length> anim-row-step: 26px;
 
     // 底衬:跟主窗口同一个组件,切外观时这里也跟着变
     Backdrop {
@@ -379,18 +391,134 @@ export component SettingsWindow inherits Window {
                 }
             }
 
-            // ── 每个动画单独调速 ──
+            // ── 每个动画:开关 + 拖动排序 + 单独调速 ──
             //
-            // 一行一个动画:名字 + 滑杆 + 当前倍率。**不做两列**:名字最长有 6 个字
-            // (「待机·纸飞机」),挤成两列就得砍名字,得不偿失;竖着排长一点无所谓。
+            // 一行一个动画:[☰ 手柄] [勾选框] [名字] [滑杆] [倍率]。
+            // **不做两列**:名字最长有 6 个字(「待机·纸飞机」),挤成两列就得砍名字。
             //
-            // 列表本身由宿主推(动画名来自 assets/pet/manifest.json,加动画不用改这里)。
-            // 拖动时**不要**把新列表推回来 —— 那样 `for` 会把整行重建,正在拖的那根
-            // 滑杆会被换掉,手感直接断掉(和当初滚轮那个「赋值后立刻读」是同一类坑)。
-            Text {
-                text: "动画速度(每个动画单独调)";
-                font-size: 12px;
-                color: Theme.text-dim;
+            // 列表本身由宿主推(动画名来自 assets/pet/manifest.json,加动画不用改这里),
+            // 而且**这个顺序就是待机轮播的顺序** —— 拖的就是它。
+            //
+            // ⚠️ 三条别改回去:
+            // 1. **拖动过程中一个字都不许推回列表** —— `for` 会把整行重建,正在拖的那一行
+            //    (以及它上面那根滑杆)会被换掉,手势当场断掉。所以拖动只在本地算落点,
+            //    松手那一刻才发 `move-pet-anim` 让宿主改顺序。
+            // 2. **勾选反过来:必须推**(宿主 `set_pet_anim_enabled` 里推)——
+            //    勾选框的 `checked` 读的是模型里的 `enabled`,不推的话勾子根本不刷新。
+            //    两种操作看着像,要求正好相反,别一概而论。
+            // 3. 行高 22 + 列表 spacing 4 = `anim-row-step`(26),落点就是按这个算的;
+            //    改行高要同步改它,否则拖动会算错位置。
+            // ── 跟随鼠标(§40)──
+            //
+            // 鼠标静止够久之后,宠物自己慢慢走过去(不实时跟)。走过去用哪个动画,
+            // 由下面动画列表里的「跟随」勾选框决定:只有正在播勾上的那些动画时才出发,
+            // 而且**走过去的时候不切动画**,接着播它当时那个。
+            Toggle {
+                label: "鼠标静止后跟着走";
+                checked: AppData.pet-follow;
+                toggled => { Logic.set-pet-follow(!AppData.pet-follow); }
+            }
+
+            // 静止多久才出发
+            HorizontalLayout {
+                spacing: 8px;
+
+                Text {
+                    text: "静止";
+                    width: 48px;
+                    font-size: 12px;
+                    color: Theme.text-dim;
+                    vertical-alignment: center;
+                }
+
+                Slider {
+                    min: 3;
+                    max: 60;
+                    value: AppData.pet-follow-delay;
+                    // 跟随关掉时这两根滑杆一起灰掉(复用 Slider 的 enabled)
+                    enabled: AppData.pet-follow;
+                    horizontal-stretch: 1;
+                    moved-to(v) => { Logic.set-pet-follow-delay(v); }
+                }
+
+                Text {
+                    text: "\{Math.round(AppData.pet-follow-delay)} 秒";
+                    width: 52px;
+                    font-size: 12px;
+                    color: AppData.pet-follow ? Theme.text : Theme.text-dim;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+            }
+
+            // 走路速度(倍率,1 = 基准速度)
+            HorizontalLayout {
+                spacing: 8px;
+
+                Text {
+                    text: "速度";
+                    width: 48px;
+                    font-size: 12px;
+                    color: Theme.text-dim;
+                    vertical-alignment: center;
+                }
+
+                Slider {
+                    min: 0.25;
+                    max: 3;
+                    value: AppData.pet-follow-speed;
+                    enabled: AppData.pet-follow;
+                    horizontal-stretch: 1;
+                    moved-to(v) => { Logic.set-pet-follow-speed(v); }
+                }
+
+                Text {
+                    text: "\{Math.round(AppData.pet-follow-speed * 100) / 100}×";
+                    width: 52px;
+                    font-size: 12px;
+                    color: AppData.pet-follow ? Theme.text : Theme.text-dim;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+            }
+
+            // 列头:两个勾选框各管什么,一眼看清(和下面每行的列宽对齐)
+            HorizontalLayout {
+                height: 16px;
+                spacing: 8px;
+
+                Text {
+                    text: "☰";
+                    width: 14px;
+                    font-size: 10px;
+                    color: Theme.text-dim;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: "轮播";
+                    width: 22px;
+                    font-size: 10px;
+                    color: Theme.text-dim;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: "跟随";
+                    width: 22px;
+                    font-size: 10px;
+                    color: Theme.text-dim;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                Text {
+                    // 两个手势都得说清:点是看、拖是排。底下那行高亮的就是正在演的
+                    text: "☰ 点一下:桌宠当场演一遍(再点收工);按住拖动排序,顺序就是轮播顺序";
+                    font-size: 11px;
+                    color: Theme.text-dim;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
             }
 
             // 外面这层只为把行距收紧(外层 VerticalLayout 的 spacing 是 10,
@@ -401,35 +529,130 @@ export component SettingsWindow inherits Window {
                 // 每一行的位置跟着飘 —— 靠坐标点击来验证/自动化时会莫名其妙点空。
                 vertical-stretch: 0;
 
-                for anim in AppData.pet-anims : HorizontalLayout {
+                // 每行套一层 Rectangle:① 好让「松手会落到这儿」的那行亮一下;
+                // ② 被拖起来的那行整体淡下去。行高仍然是 22(窗口高度不用动)。
+                for anim[i] in AppData.pet-anims : Rectangle {
+                    // 「桌宠正在演这个」的那一行 —— 判据是宿主推的 `AppData.pet-preview`。
+                    // 它是**单独一个全局属性**,不是 PetAnim 里的字段:改它不会重建
+                    // 这个列表,而点 ☰ 的同时很可能正按着在拖动(§39 那条)。
                     height: 22px;
-                    spacing: 8px;
+                    background: root.drag-name != "" && root.drag-to == i
+                        ? Theme.accent-soft
+                        : (AppData.pet-preview == anim.name ? Theme.accent-soft : transparent);
+                    opacity: root.drag-name == anim.name ? 0.35 : 1;
 
-                    Text {
-                        text: anim.label;
-                        width: 80px;
-                        font-size: 12px;
-                        color: Theme.text-dim;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
+                    HorizontalLayout {
+                        width: parent.width;
+                        height: parent.height;
+                        spacing: 8px;
 
-                    Slider {
-                        min: 0.25;
-                        max: 3;
-                        value: anim.speed;
-                        horizontal-stretch: 1;
-                        moved-to(v) => { Logic.set-pet-anim-speed(anim.name, v); }
-                    }
+                        // ── 拖动手柄:三条横线 ──
+                        // 不用「☰」那个字符:字体里有没有、多宽都不确定,画出来更稳
+                        Rectangle {
+                            property <bool> lit:
+                                root.drag-name == anim.name
+                                    || AppData.pet-preview == anim.name;
 
-                    Text {
-                        // 两位小数:1.25× 这种中间值也要看得出区别
-                        text: "\{Math.round(anim.speed * 100) / 100}×";
-                        width: 44px;
-                        font-size: 12px;
-                        color: Theme.text;
-                        horizontal-alignment: right;
-                        vertical-alignment: center;
+                            width: 14px;
+                            height: parent.height;
+                            background: transparent;
+
+                            Rectangle {
+                                width: 10px; height: 1px; x: 2px; y: 8px;
+                                background: lit ? Theme.accent-ink : Theme.text-dim;
+                            }
+                            Rectangle {
+                                width: 10px; height: 1px; x: 2px; y: 11px;
+                                background: lit ? Theme.accent-ink : Theme.text-dim;
+                            }
+                            Rectangle {
+                                width: 10px; height: 1px; x: 2px; y: 14px;
+                                background: lit ? Theme.accent-ink : Theme.text-dim;
+                            }
+
+                            TouchArea {
+                                mouse-cursor: grab;
+                                changed pressed => {
+                                    if (self.pressed) {
+                                        // **点一下 = 让真桌宠演一遍**(设置页里没有缩略图,
+                                        // 预览就是桌宠本人;它按这一行自己的速度播,所以
+                                        // 拖速度滑杆时能当场看出快慢)。再点同一个 = 收工。
+                                        // 直接拖着走也没关系:那会儿它就在演你拖的这一行。
+                                        Logic.preview-pet-anim(anim.name);
+                                        root.drag-name = anim.name;
+                                        root.drag-from = i;
+                                        root.drag-to = i;
+                                        // 指针的**绝对** y —— 不能用窗口内坐标(见 pet.slint 那个坑)
+                                        root.drag-y0 = self.absolute-position.y + self.mouse-y;
+                                    } else {
+                                        if (root.drag-name != "" && root.drag-to >= 0) {
+                                            Logic.move-pet-anim(root.drag-name, root.drag-to);
+                                        }
+                                        root.drag-name = "";
+                                        root.drag-from = -1;
+                                        root.drag-to = -1;
+                                    }
+                                }
+                                moved => {
+                                    // 走了几行 = 位移 / 行距(四舍五入),再夹到 0..n-1
+                                    root.drag-to = clamp(
+                                        root.drag-from + Math.round(
+                                            (self.absolute-position.y + self.mouse-y - root.drag-y0)
+                                                / root.anim-row-step
+                                        ),
+                                        0,
+                                        AppData.pet-anims.length - 1,
+                                    );
+                                }
+                            }
+                        }
+
+                        // ── 轮播开关:关掉的一律不播(待机轮播跳过,看书/购物也不切)──
+                        VCenter {
+                            TodoCheck {
+                                checked: anim.enabled;
+                                toggled => { Logic.set-pet-anim-enabled(anim.name, !anim.enabled); }
+                            }
+                        }
+
+                        // ── 跟随开关:在这个动画期间允不允许「跟着鼠标走」──
+                        // 和上面那个是两件事:可以关掉轮播、只让它负责走过去
+                        VCenter {
+                            TodoCheck {
+                                checked: anim.follow;
+                                toggled => { Logic.set-pet-follow-anim(anim.name, !anim.follow); }
+                            }
+                        }
+
+                        Text {
+                            text: anim.label;
+                            width: 72px;
+                            font-size: 12px;
+                            // 正在试演的那个名字挑出来;关掉的那行淡下去(一眼看出它不参与)
+                            color: AppData.pet-preview == anim.name ? Theme.accent-ink
+                                : (anim.enabled ? Theme.text-dim : Theme.border-strong);
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+
+                        Slider {
+                            min: 0.25;
+                            max: 3;
+                            value: anim.speed;
+                            enabled: anim.enabled;
+                            horizontal-stretch: 1;
+                            moved-to(v) => { Logic.set-pet-anim-speed(anim.name, v); }
+                        }
+
+                        Text {
+                            // 两位小数:1.25× 这种中间值也要看得出区别
+                            text: "\{Math.round(anim.speed * 100) / 100}×";
+                            width: 44px;
+                            font-size: 12px;
+                            color: anim.enabled ? Theme.text : Theme.text-dim;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
                     }
                 }
             }
