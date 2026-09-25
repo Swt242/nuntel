@@ -64,7 +64,7 @@ fn generate_pet_frames() {
 ///
 /// Windows 上文件图标只能来自资源段,不嵌的话桌面/任务栏/资源管理器里显示的是
 /// 通用默认图标。资源要用 rc 编译器编成 COFF 目标文件再交给链接器:
-/// 优先用 GNU 的 `windres`(GNU 工具链自带,`run.sh` 已经把它加进 PATH),
+/// 优先用 GNU 的 `windres`(GNU 工具链自带),
 /// 找不到就跳过 —— 不阻断构建,只是图标退化成默认的。
 fn embed_windows_icon() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
@@ -86,8 +86,8 @@ fn embed_windows_icon() {
             .unwrap_or(false)
     };
 
-    // 常规情况:windres 自己会去找 gcc 做预处理。
-    // Git Bash 的这台机器没有 C 编译器,所以退一步用 `cat` 假装预处理器 ——
+    // 常规情况:windres 自己会去找 gcc 做预处理。要是环境里没有 C 预处理器
+    // (只有 GNU 工具链的 binutils 而没有 gcc),就退一步用 `cat` 假装预处理器 ——
     // 反正 assets/icon.rc 只有一行、没有宏也没有注释(cat 不会剥注释,windres
     // 不认识带注释的原文,所以那个文件里别写注释)。
     let ok = build("windres", &[])

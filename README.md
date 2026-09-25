@@ -56,7 +56,7 @@
   **独立的设置窗口**切换,带预览图,选择记到下次启动。只有毛玻璃用 DWM 圆角(Win11 起),
   另外两套是直角。见下面「外观」一节
 - **exe 带图标**:`assets/icon.ico` 由脚本生成,构建时嵌进资源段
-  (GNU 工具链用 `windres`,MSVC 用 Windows SDK 的 `rc.exe`)
+  (走 Windows SDK 的 `rc.exe`)
 - 数据自动存成 JSON,旧版本数据能直接打开(升级时自动备份)
 
 ## 运行
@@ -67,8 +67,14 @@ cargo run                              # 不带 Skia:文字稍糊,桌宠没法�
 cargo test                             # 单元测试
 ```
 
-装了 **VS Build Tools(C++ 工作负载)** 之后就走默认的 MSVC 工具链,直接 `cargo` 即可。
-`run.sh` 是之前没装 MSVC 时的 GNU 工具链后备方案,现在不需要了(留着以防别的机器)。
+### 构建前置条件
+
+- **MSVC 工具链**(`x86_64-pc-windows-msvc`),带 C++ 工作负载。依赖里有 C 代码
+  (tree-sitter 本体和 8 个语法包都是 C,经 `cc` 编),所以**光有链接器不够,必须有 C 编译器**。
+- ⚠️ **要 MSVC 14.44 或更新**(对应 VS 2022 17.14+)。`--features skia` 用的 Skia 预编译包里
+  引用了新版 MSVC STL 的矢量化算法符号(`__std_search_1`、`__std_find_first_of_trivial_pos_1`),
+  老 STL 里没有,链接会报 `LNK2019`。
+- `tools/make_icon.py` 需要 Python 3(只在重新生成图标时用)。
 
 产物在 `target/release/nuntel.exe`,独立的 exe,不依赖 MSVC 运行库之外的额外东西。
 
@@ -479,7 +485,7 @@ Rust 侧用 `Vec<Todo>` 作唯一数据源,**每次变更都重建一份「按�
 
 ## 已知问题
 
-- **系统通知在这台机器上不显示**。提醒管道本身是通的(到点触发、`notified` 落盘、
+- **系统通知在某些环境下不显示**。提醒管道本身是通的(到点触发、`notified` 落盘、
   `Toast::show()` 无报错都实测过),但通知气泡看不到 —— 连 PowerShell 自己发的 toast
   也不出现,所以是系统层面的通知抑制(专注助手/通知策略),不是代码问题。
   应用内的横幅 + 整行高亮是兜底,不会漏掉提醒。
@@ -489,8 +495,8 @@ Rust 侧用 `Vec<Todo>` 作唯一数据源,**每次变更都重建一份「按�
 
 ## 只预览界面(不用编译 Rust)
 
-`slint-viewer` 可以直接渲染 `.slint` 文件,改样式时迭代很快
-(本机装在 `~/.slint-tools/slint-viewer.exe`):
+`slint-viewer` 可以直接渲染 `.slint` 文件,改样式时迭代很快。
+它是 Slint 仓库 `tools/viewer` 下的独立工具,不在本仓库里,需要自己装:
 
 ```sh
 slint-viewer --check ui/app.slint                     # 只做编译检查
@@ -505,8 +511,8 @@ slint-viewer --load-data ui/sample-data.json ui/app.slint   # 打开预览
 Slint 内置了 MCP 服务器,可以列元素树、读属性、截图、模拟点击输入:
 
 ```sh
-SLINT_EMIT_DEBUG_INFO=1 ./run.sh build --features slint/mcp
-SLINT_MCP_PORT=9315 ./target/x86_64-pc-windows-gnu/debug/nuntel.exe
+SLINT_EMIT_DEBUG_INFO=1 cargo build --features slint/mcp
+SLINT_MCP_PORT=9315 ./target/debug/nuntel.exe
 ```
 
 然后用 MCP 客户端连:

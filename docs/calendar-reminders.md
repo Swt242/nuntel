@@ -385,14 +385,14 @@ ui.window().hide()?;   // 托盘菜单的「打开主窗口」再 show 回来
 
 ## 11. 验收结果
 
-实测环境:Windows 11 22621,Rust 1.96(GNU 工具链),Slint 1.18。
+验收环境:Windows 11,Rust(GNU 工具链),Slint 1.18。
 「界面」类项是用应用内置的 MCP 服务器驱动真实界面做的,不是看代码推断的。
 
 ### 提醒
 
 | 项 | 结果 | 说明 |
 |---|---|---|
-| 到点弹通知、只弹一次 | ⚠️ 部分 | 到点触发、`notified` 落盘、`Toast::show()` 无报错都实测通过;但**通知气泡本身没能在这台机器上看到** |
+| 到点弹通知、只弹一次 | ⚠️ 部分 | 到点触发、`notified` 落盘、`Toast::show()` 无报错都实测通过;但**通知气泡本身在验收环境里没能看到** |
 | 重启后不重弹 | ✅ | `notified` 持久化生效 |
 | 改时间后重新提醒 | ✅ | 单测 + 实测:改完时间 `notified` 被重置 |
 | 完成任务后不提醒 | ✅ | 单测 `done_and_muted_tasks_never_fire` |
@@ -401,7 +401,7 @@ ui.window().hide()?;   // 托盘菜单的「打开主窗口」再 show 回来
 | 全天任务当天 09:00 提醒 | ✅ | 单测 `all_day_task_fires_at_nine` |
 | 应用没运行时错过的提醒,下次启动补 | ✅ | 实测:启动后横幅显示「有 2 条提醒」,对应任务整行高亮 |
 
-**通知为什么不显示**:这台机器上**连 PowerShell 自己发的 toast 都不出现** ——
+**通知为什么不显示**:验收环境里**连 PowerShell 自己发的 toast 都不出现** ——
 我用同一个 AppID 直连 WinRT API 做了对照实验,通知中心里也查不到,
 所以是系统层面的通知抑制(专注助手/通知策略),不是代码问题。
 提醒管道(main.rs 定时器 → reminder::scan → notified 落盘 → platform::notify)逐段验证过。
@@ -443,7 +443,7 @@ ui.window().hide()?;   // 托盘菜单的「打开主窗口」再 show 回来
 7. **std-widgets 的 CheckBox/ComboBox 跟系统 `Palette`**,应用手动切暗色时它们会发白;
    而 `Palette.color-scheme` 从 Rust 和 .slint 都设不了(生成的是样式内部的 `FluentPalette`)。
    结论:要么别手动切主题,要么自己画控件 —— 本项目选了后者。
-8. **rustup 的 `dlltool` 只在自己所在目录找汇编器 `as`**,放 PATH 上不管用;见 `run.sh` 里的说明。
+8. **rustup 的 `dlltool` 只在自己所在目录找汇编器 `as`**,放 PATH 上不管用(这一条只在走 GNU 工具链时才相关)。
 
 
 ## 12. 代码结构（预计改动）
@@ -533,10 +533,11 @@ docs/calendar-reminders.md  本文档
   输出 `assets/icon.ico`(16/24/32/48/64/128/256 七个尺寸)。改设计只改脚本重跑。
 - `build.rs` 用 `windres` 把 `assets/icon.rc` 编成 COFF 目标文件再交给链接器 ——
   Windows 的文件图标只能来自 PE 的资源段。
-- ⚠️ 这台机器没有 C 编译器,而 `windres` 默认要调 `gcc -E` 做预处理。
-  退路是 `--preprocessor=cat` 让它把原文透传过去。**代价是 `assets/icon.rc` 里
+- ⚠️ `windres` 默认要调 `gcc -E` 做预处理,所以**没有 C 预处理器的环境要靠退路**:
+  `--preprocessor=cat` 让它把原文透传过去。**代价是 `assets/icon.rc` 里
   不能写注释**(cat 不剥注释,windres 又不认带注释的原文,会报 syntax error)。
   build.rs 里是按「windres 常规 → 带 cat 透传」的顺序试的。
+  MSVC 工具链下走 Windows SDK 的 `rc.exe`,不走这条。
 
 ### 14.2 自定义标题栏
 
@@ -652,7 +653,7 @@ Skia 的 GL surface 倒是会**优先挑**带 alpha 的 config
 `set_transparent`,并且让 winit 后端在非 macOS 平台也把标志送进渲染器)。
 一期不做,所以毛玻璃改为**纯应用内实现**。
 
-顺带一提,`DWMWA_SYSTEMBACKDROP_TYPE`(Win11 22H2 起,本机 22621 正好支持)
+顺带一提,`DWMWA_SYSTEMBACKDROP_TYPE`(Win11 22H2 起才有)
 也帮不上忙:它同样要求应用画的内容带 alpha 通道,前提不成立。
 
 ### 16.2 没有 `backdrop-filter`,用「本来就是糊的底」绕过去
@@ -2085,8 +2086,8 @@ prev-w: area-w - src-w
   (笔记行的删除按钮就是)用它验不了 —— 截图里那个按钮永远不出现,看着像功能坏了。
   要么用 `SetCursorPos` + `mouse_event`(真光标,`badge-click.py` 那套),
   要么就别验悬停态。
-- **悬停 + 截图必须在同一个进程里连着做完**,中间别插别的命令:真鼠标随时会被动一下
-  (这台机器上一轮就被骗过好几回),光标一跑,悬停态就没了。
+- **悬停 + 截图必须在同一个进程里连着做完**,中间别插别的命令:真人鼠标随时会被动一下
+  (验收时上一轮就被骗过好几回),光标一跑,悬停态就没了。
 
 ## §30 改名:rgui-todo → Nuntel
 
@@ -2688,9 +2689,9 @@ UI 只负责摆。不设上限的话,一张手机截图能把预览撑成一条�
 
 ### 36.1 怎么接的
 
-- **依赖**:`tree-sitter`(本体是 C 库,经 `cc` 编)+ 每个语言一个语法包。实测本机
-  **MSVC 能把它们编出来**(`cl.exe` 没问题),不需要 `run.sh` 那套 GNU 后备。
-  首次拉包要走代理:`HTTPS_PROXY=http://127.0.0.1:7890 cargo fetch`。
+- **依赖**:`tree-sitter`(本体是 C 库,经 `cc` 编)+ 每个语言一个语法包。
+  这些都必须由 C 编译器编出来,所以**构建环境得有 C 编译器**(MSVC 工具链的
+  `cl.exe` 就够),光有链接器不行。首次拉包要联网。
 - **新模块 `src/highlight.rs`**(纯逻辑 + 单测):把 `(语言, 代码)` 变成
   **按行、按段**的结构 `Vec<Vec<Span>>`,`Span = { 文字, 类别 }`。
 - **类别只有 7 个**(普通/关键字/字符串/注释/数字/函数/类型)。刻意少:类别一多,
@@ -2740,7 +2741,7 @@ rust / python / json / go 是 `HIGHLIGHTS_QUERY`;typescript 一个包两个语�
 
 | 项目 | 结果 |
 |---|---|
-| 单测 | 93 个全过(87 老 + 6 新:关键字/字符串/注释/数字分类、JS·TS·TSX 各走对自己的 query、认不出的语言单色、空行不塌、半截代码不 panic 且一字不丢)✅ |
+| 单测 | 全过(87 老 + 6 新:关键字/字符串/注释/数字分类、JS·TS·TSX 各走对自己的 query、认不出的语言单色、空行不塌、半截代码不 panic 且一字不丢)✅ |
 | rust / python / typescript / json / bash 代码块 | 关键字紫、字符串绿、注释灰、数字橙、函数蓝、类型黄,都对 ✅ |
 | 认不出的语言(brainfuck) | 原样单色 ✅ |
 | 超长行 | 按设计**裁掉**(不折行)✅ |

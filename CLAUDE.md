@@ -21,23 +21,22 @@ exe 文件名、托盘悬停提示、数据目录。
 ```sh
 cargo run --release --features skia   # 推荐:文字最锐 + 桌宠能透明
 cargo run                             # 不带 skia:文字稍糊,桌宠是一块黑方块
-cargo test --release                  # 93 个单测,应该全过
+cargo test --release                  # 106 个单测,应该全过
 cargo test --release fling            # 只跑名字含 "fling" 的
 cargo test --release model::tests::badge_shows_overdue_and_relative_days
 ```
 
-- **加新依赖要联网**,本机得走代理:`HTTPS_PROXY=http://127.0.0.1:7890 cargo fetch`
-  (语法高亮那几个 tree-sitter 包就是这么拉的;C 代码由 `cl.exe` 编,MSVC 下没问题)。
-- **默认 MSVC 工具链**(本机装了 VS 2022 Build Tools)。`run.sh` 是没装 MSVC 时的
-  GNU 后备方案,会补 MinGW 导入库和 binutils,用 `./run.sh test --release` 这样调。
-  ⚠️ `--features skia` 在 GNU 工具链下**编不过**(Skia 只有 MSVC 的预编译包)。
+- **加新依赖要联网**(语法高亮那几个 tree-sitter 包,和 Skia 的预编译包,都是这么拉的)。
+  如果你的网络环境非走代理不可,自己给 cargo 设 `HTTPS_PROXY` 就行 —— API 是标准的,
+  项目这边没有任何特殊要求。
 - **release 没有控制台**(源码首行 `windows_subsystem = "windows"`),所有诊断走
   `platform::log` 写进 `%APPDATA%\nuntel\nuntel.log`(启动时超过 256KB 截断)。
   调试时报错看不到就去读这个文件。debug 构建才有控制台。
 - **进程是单实例的**(命名互斥体):已经开着一个时再启动只会把原窗口叫到前台然后退出。
   所以要重建 exe 得先杀掉正在跑的那个,否则链接会因 exe 被占用失败。
-- 只想改样式不用编 Rust:`~/.slint-tools/slint-viewer.exe --check ui/app.slint`
+- 只想改样式不用编 Rust:用 `slint-viewer --check ui/app.slint` 单查语法,迭代比整编快得多
   (`--load-data` 认不出跨文件 import 的 global,预览整窗口请直接跑程序)。
+  slint-viewer 是 Slint 仓库 `tools/viewer` 下的独立工具,不在本仓库里。
 - 桌宠动画的**顺序和开关**存在 `pet_anim_order` / `pet_anim_off` 里,**顺序就是待机轮播顺序**
   (不再是随机;见 §39)。加素材后两边对不上的情况由 `pet::effective_order` 兜着。
 - 设置里那 10 行动画的**预览就是桌宠本人**(点 ☰ 当场演一遍,见 §41):所以那一列图标
@@ -275,9 +274,13 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
 
 ## 测试
 
-全部是模块内联的 `#[cfg(test)] mod tests`,没有 `tests/` 目录。93 个,分布在
-`markdown`(24)、`main.rs`(17:`mod tests` 时间选择器 6 个 + `mod fling_tests` 滚轮惯性 11 个)、
-`notes`(12)、`ai`(10)、`reminder`(10)、`highlight`(6)、`calendar_info`(5)、`model`(5)、`pet`(4)。
+全部是模块内联的 `#[cfg(test)] mod tests`,没有 `tests/` 目录。106 个,分布在
+`markdown`(24)、`pet`(17)、`notes`(12)、`main.rs`(17:`mod tests` 时间选择器 6 个 +
+`mod fling_tests` 滚轮惯性 11 个)、`reminder`(10)、`ai`(10)、`highlight`(6)、
+`model`(5)、`calendar_info`(5)。
+
+> 数字会随功能变,**别把它当断言用**;要准确值跑
+> `cargo test --release -- --list | Select-String ': test$'`。
 
 写测试时的惯例:**纯计算拆成自由函数或独立模块**,这样不用起 UI 就能测。
 `main.rs` 里几个可测的辅助函数(`due_from_picker`、`fling_*`)就是为此留在模块级的。
@@ -292,7 +295,7 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
 
 - `tools/pet-ring.py`(Python)—— **首选范式**:一个进程里一口气做完「挪光标 → 等环弹出 →
   PrintWindow 截图 → 按几何算出图标坐标 → 合成点击 → 报哪个窗口变可见」。
-  为什么必须一口气做完:悬停判定读的是**全局光标**,这台机器上真鼠标随时会被动一下,
+  为什么必须一口气做完:悬停判定读的是**全局光标**,真人操作鼠标随时会被动一下,
   分几步做中间光标就跑掉了,环会自己收起来,看起来像「根本没弹」。
 - `tools/badge-click.py` —— 被 `pet-ring.py` import,提供 `find` / `rect_of` / `click_at` /
   `grab` / `BITMAPINFO` 这些底座。
@@ -326,8 +329,8 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
   (`BitBlt` 一块区域,60fps 能抓到)+ **同时记 `GetWindowRect`**,再把「每一帧变了什么」
   打成时间线 —— §32 那个「窗口先变了、内容还没跟上」就是这么抓到的。判「宠物有没有动」
   看窗口底边和宠物中心,比看画面像素靠谱。
-- ⚠️ **这台机器上有两个测量陷阱**:壁纸是**动的**(那段带 `Video` 字样的画面),
-  「和某个背景色比」判断有没有像素会一直误判;用户的**真鼠标随时会被挪一下**,
+- ⚠️ **桌面是个不稳定的测量场,有两个陷阱**:壁纸上可能有**动的东西**在放,
+  「和某个背景色比」判断有没有像素会一直误判;真人的**鼠标随时会被挪一下**,
   按住不放那种操作中途会跑掉。所以:比「和上一帧的差」而不是比固定颜色;
   合成点击**要重试**,而且得让被测的那件事留个**可观察的痕迹**(写一行日志、
   窗口位置变一下)才知道这一下点中没有 —— 别拿「画面看着像」当判据。
