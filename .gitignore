@@ -15,3 +15,9 @@ __pycache__/
 .idea/
 .vscode/
 *.iml
+
+# 本地装的 Slint 开发工具(slint-viewer / slint-lsp,约 48MB 二进制)。
+# **技能定义要进仓库**(.dsh/skills 只有几十 KB,是官方 slint-ui/ai-plugins 的副本,
+# 让协作者和 AI 都拿到同一套约定),只把工具排除 —— 按 .dsh/skills/slint/tools-install.md
+# 自己装即可。注意末尾的 `/*` 不能少:写 `.dsh/tools` 只会忽略目录本身。
+.dsh/tools/

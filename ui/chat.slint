@@ -74,13 +74,31 @@ component Field inherits Rectangle {
     in-out property <string> text;
     in property <bool> secret: false;
     in property <string> hint;
+    /// 输入框本体高度
+    in property <length> box-h: 28px;
+    /// 说明文字相对**本元素顶部**的 y。
+    ///
+    /// ⚠️ 这个数**不能按「输入框高度 + 间隙」推**,实测渲染位置比设定值低约 11px
+    /// (Text 的上方留白 + 基线不在元素顶部),所以:
+    ///
+    /// | hint-y | 实测到输入框底边的间隙 |
+    /// |---|---|
+    /// | 31(原值) | ~0px,文字直接贴在框上 |
+    /// | 34 | 1px |
+    /// | 40 | 2px |
+    /// | 44 | 4px |
+    /// | **46** | **4~5px** ← 取这个 |
+    ///
+    /// 用 `sm` 这种滑杆式的微调根本量不准,只能用 `slint-viewer --screenshot`
+    /// 渲染出来数像素。改这个值请连着 `height`(下面那行)和面板总高一起改。
+    in property <length> hint-y: 46px;
 
-    height: hint == "" ? 28px : 44px;
+    height: hint == "" ? box-h : hint-y + 14px;
     background: transparent;
 
     Rectangle {
         width: parent.width;
-        height: 28px;
+        height: root.box-h;
         border-radius: 8px * Theme.radius-scale;
         background: Theme.inset;
         border-width: 1px;
@@ -104,7 +122,7 @@ component Field inherits Rectangle {
         text: root.hint;
         font-size: 10px;
         color: Theme.text-dim;
-        y: 31px;
+        y: root.hint-y;
         width: parent.width;
         wrap: word-wrap;
     }
@@ -200,9 +218,11 @@ export component ChatWindow inherits Window {
         x: 8px;
         y: 42px;
         width: parent.width - 16px;
-        // 高度按内容量出来的:上下内边距 24 + 标题 16 + 3 个「输入框+说明」44×3
-        // + 6 个间距 48 + 按钮行 30 ≈ 250。给矮了会全都压在一起(实测 210 就是这样)。
-        height: 258px;
+        // 高度按内容量出来的:上下内边距 24 + 标题 16 + 3 个「输入框 + 说明」60×3
+        // + 5 个间距 40 + 按钮行 30 ≈ 290。
+        // ⚠️ 给矮了会全都压在一起(实测 210 就是这样);**改 Field 的 box-h / hint-y
+        // 之后这里必须跟着重算**,否则底下那条说明文字会被面板底边裁掉。
+        height: 290px;
         border-radius: 12px * Theme.radius-scale;
         // 用 sheet 不用 card:它压在消息上,太透会「字压字」(同主窗口浮层的道理)
         background: Theme.sheet;
