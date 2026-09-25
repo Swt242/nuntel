@@ -80,6 +80,23 @@ cargo test                             # 单元测试
   老 STL 里没有,链接会报 `LNK2019`。
 - `tools/make_icon.py` 需要 Python 3(只在重新生成图标时用)。
 
+### 发布二进制时注意:VC++ 运行库
+
+默认构建(含 `--features skia`)的 exe **依赖 `MSVCP140.dll` / `VCRUNTIME140.dll`**。
+开发机上装了 VS 所以一定有,但干净的用户机器上可能没有,表现是双击报缺 DLL。
+分发时二选一:
+
+- 让用户装[官方 VC++ 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe)(最省事)
+- 或者把这两个 DLL 一起放进压缩包
+
+> **静态链接 CRT 行不通(已实测)**:`RUSTFLAGS="-C target-feature=+crt-static"` 确实能编出
+> 不含 `VCRUNTIME`/`MSVCP` 依赖的 exe,但**只在不带 skia 时成立** ——
+> 预编译的 `skia.lib` 自带 `/DEFAULTLIB:msvcrt.lib`、`msvcprt.lib`(动态 CRT),
+> 而 rust-skia 的 Windows 预编译包也**没有** `-static` 变体,所以 `+crt-static` 会迫使
+> skia-bindings 从源码编 Skia,那需要 LLVM + Ninja,本机没有。
+> 想真要静态 + skia,得自己装 LLVM/Ninja 编一遍 Skia(耗时很长)。
+> 静态但不带 skia 的版本可以当"无需运行库"的备用包,代价是桌宠不透明、文字稍糊。
+
 产物在 `target/release/nuntel.exe`,独立的 exe,不依赖 MSVC 运行库之外的额外东西。
 
 > **为什么双击 debug 的 exe 会多一个黑窗口**
