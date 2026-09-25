@@ -191,6 +191,12 @@ export component ChatWindow inherits Window {
 
     // ── 绑定设置(盖在消息区上,点齿轮开关)──
     if AppData.chat-config-open : Rectangle {
+        // ⚠️ **必须显式抬 z。** 默认 z=0 时「后声明的兄弟盖住先声明的」这条规则
+        // 在这里**不成立**:`chat-scroll` 是个 ScrollView(内建组件),实测它照样
+        // 画在本浮层之上 —— 表现是空状态那句欢迎语穿过面板、和面板标题「接口设置」
+        // 逐字重叠(截图复现过)。给浮层 z:10 就正常了。
+        // 同一层里还有别的浮层要盖过滚动区时,记得一起抬。
+        z: 10;
         x: 8px;
         y: 42px;
         width: parent.width - 16px;
