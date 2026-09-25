@@ -200,7 +200,11 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
   `pet-touch` / `pet-body` 后面,否则会被盖住点不到。
 - `TouchArea.mouse-x/y` 是**相对本元素**的,算全局位置要用 `self.absolute-position`
   而不是父元素的(`src/main.rs` 的坑记录见 §27.3)。
-- 桌宠素材版权归**鹰角网络**,仅供个人使用,不随本项目代码许可授权。
+- 桌宠素材版权归**鹰角网络**,**不在本项目的 MIT 许可范围内**(代码是 MIT,素材不是)。
+  来源是鹰角 2026 夏活的官方素材包,逐帧 PNG 由 `tools/pet-assets` 转出。
+  完整声明与「使用前请自行核实授权」的提醒写在 `THIRD-PARTY-NOTICES.md` ——
+  往仓库里加素材、或者改动许可相关文案时,那三处(README / CLAUDE.md / NOTICES)
+  要一起看,别只改一处。
   换素材:逐帧 PNG 丢进 `assets/pet/<名字>/` + 在 `manifest.json` 加一行,**不用改 Rust**
   (帧表由 `build.rs` 生成,用 `include_bytes!` 嵌进 exe,所以与工作目录无关)。
   删掉 `assets/pet/` 桌宠会自动不启动。
@@ -338,7 +342,11 @@ Slint 的 `Timer` **被 drop 就停**,所以必须存进 `State`(别用临时变
 ## 文档
 
 - `README.md` —— 给用户看的:功能、外观主题、桌宠、AI 对话、Markdown、渲染器选择、
-  代码结构。改动面向用户的特性时同步更新。
-- `docs/calendar-reminders.md` —— 产品设计文档 + 每轮的验收结果,按 § 编号(已到 §32),
+  代码结构、参与贡献、许可。改动面向用户的特性时同步更新。
+- `CONTRIBUTING.md` —— 给贡献者看的:中文约定、提交前要跑什么、UI 怎么验、
+  素材的授权边界。**改了协作方式或验收要求就同步这里。**
+- `THIRD-PARTY-NOTICES.md` —— 许可边界:哪些内容不在 MIT 范围内(桌宠素材、截图里的
+  壁纸)、依赖各自的许可证。**改动许可相关文案时,这里和 README / CLAUDE.md 三处一起看。**
+- `docs/calendar-reminders.md` —— 产品设计文档 + 每轮的验收结果,按 § 编号(已到 §42),
   §11 之后每一节末尾都有「这一轮踩到的坑」。**代码注释直接引用这些编号**,
   所以新增一节时接着编号往下写,别插队。

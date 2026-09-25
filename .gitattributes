@@ -1,0 +1,15 @@
+# 文本文件统一用 LF 存、检出时不改。
+#
+# Windows 上 git 默认会把检出时的换行转成 CRLF(autocrlf=true),那样同一份源码在不同
+# 机器上工作区内容不一致,截图/验证脚本里按字节比对的地方也会受影响。
+# 这里显式钉成 LF,换平台克隆不会产生"整个文件都改了"的假 diff。
+* text=auto eol=lf
+
+# 二进制资源:别做换行转换,也别指望能 diff 出内容
+*.png binary
+*.ico binary
+*.gif binary
+*.exe binary
+
+# 锁文件:合并时按我们的(别让 git 自动合并出一个坏掉的 Cargo.lock)
+Cargo.lock merge=ours

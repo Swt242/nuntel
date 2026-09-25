@@ -12,8 +12,13 @@
 //! 用法(在仓库根目录):
 //!   cargo run --release --manifest-path tools/pet-assets/Cargo.toml
 //!
-//! 输入:`refs/Angelina/art/images/*.gif`(那个参考项目的素材,不进我们的仓库)
+//! 输入:夏活官方素材包里的 GIF。把素材包解出来的 `art/images/*.gif` 放到
+//! `refs/Angelina/art/images/` 下(那个参考目录是 gitignore 的,素材包本身不进仓库)
 //! 输出:`assets/pet/<名字>/00.png …` + `assets/pet/manifest.json`
+//!
+//! ⚠️ **产物是有版权的**:素材归鹰角网络,不在本项目的 MIT 许可内。
+//! 输出到 `assets/pet/` 就等于把它连同仓库一起分发了,动手前先看
+//! `THIRD-PARTY-NOTICES.md`。
 
 use std::fs;
 use std::io::BufReader;

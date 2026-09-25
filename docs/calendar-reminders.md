@@ -1231,11 +1231,16 @@ fn background() -> Self { Self(0) }   // 全透明(alpha=0),而不是不透明�
 
 ### 22.2 素材
 
-参考项目 `CorvusCinereus/Angelina`(Qt6/C++ 写的安洁莉娜桌宠)的 `art/images`:
+初版用的是参考项目 `CorvusCinereus/Angelina`(Qt6/C++ 写的安洁莉娜桌宠)的 `art/images`:
 10 个 1024×1024 的 GIF,共 12MB。直接塞进仓库太占地方,而且有两道坎:
 
 - **Slint 的 `Image` 是静态的,不会播动图** —— 帧必须由宿主推。
 - Slint 默认只解 PNG/JPEG/SVG,要吃 GIF 得开 `image-default-formats` 特性(体积变大)。
+
+> 📌 **后记(素材来源已换)**:现在仓库里这批 PNG 的来源是**鹰角 2026 夏活的官方素材包**
+> (SideStory「直到大地变成一颗酸橙」),不再是上面那个参考项目。下面那套技术取舍
+> (拆帧 / 缩到 224 / 不进主 crate 依赖树)没变,`tools/pet-assets` 的输入路径也还是
+> `refs/Angelina/art/images`。授权情况见 `THIRD-PARTY-NOTICES.md`。
 
 所以加了 `tools/pet-assets` 这个小工具:**把 GIF 拆成逐帧 PNG 并缩到 224×224**。
 结果 3MB(缩到四分之一),主程序一个额外依赖都不用加。它故意不并进主 crate 的
@@ -1243,10 +1248,9 @@ workspace —— `image` 那一堆解码器不该进主程序的依赖树。
 
 产物进仓库,**原始的 GIF 不进**(它们在 `refs/` 里,那个目录是 gitignore 的)。
 
-> ⚠️ **版权**:角色 IP 与美术资产归**鹰角网络**所有(源项目自己写明的:
-> 「角色 IP 归鹰角网络所有、图片素材加工自鹰角网络官方提供的素材」)。
-> 本项目沿用这些素材仅供个人使用,不随代码的许可一起授权。不使用素材时删掉
-> `assets/pet/` 即可,桌宠会自动不启动(见下)。
+> ⚠️ **版权**:角色 IP 与美术资产归**鹰角网络**所有(来源:2026 夏活官方素材包)。
+> 本项目沿用这些素材,但它们**不在代码的 MIT 许可范围内**,详见 `THIRD-PARTY-NOTICES.md`。
+> 不使用素材时删掉 `assets/pet/` 即可,桌宠会自动不启动(见下)。
 
 ### 22.3 帧表在构建时生成
 

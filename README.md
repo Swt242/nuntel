@@ -1,5 +1,9 @@
 # Nuntel
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078D4.svg)](#构建前置条件)
+[![Rust](https://img.shields.io/badge/Rust-2024%20edition-000000.svg?logo=rust)](https://www.rust-lang.org/)
+
 一个用 [Rust](https://www.rust-lang.org/) + [Slint](https://slint.dev/) 写的 Windows 桌面小挂件:
 **桌宠停在桌面角落,待办清单、Markdown 笔记、AI 对话都从它展开**。
 任务可以带时间,到点提醒,日历上能看到排期。
@@ -351,12 +355,16 @@ Azure 认的,多发的那个会被忽略,这样你就不用先搞清楚自己用
 
 ### 素材来源与版权
 
-⚠️ **桌宠的形象素材来自 [CorvusCinereus/Angelina](https://github.com/CorvusCinereus/Angelina)**
-(一个 Qt6/C++ 写的安洁莉娜桌宠)。**角色 IP 与美术资产归鹰角网络所有** ——
-源项目自己写明「图片素材加工自鹰角网络官方提供的素材」。这些素材**仅供个人使用,
-不随本项目代码的许可一起授权**。
+⚠️ **桌宠的美术素材版权归鹰角网络(Hypergryph)所有,不适用本项目的 MIT 许可证。**
 
-不想用它们的话:删掉 `assets/pet/` 即可,桌宠会自动不启动(日志里会记一句)。
+它们来自鹰角随 2026 年夏活 SideStory「直到大地变成一颗酸橙」发布的**官方素材包**,
+本仓库里的逐帧 PNG 是 `tools/pet-assets` 从素材包的 GIF 转出来的。
+**本仓库不对这些素材的授权做任何主张** —— 你要用(尤其商业用途)之前请自行向官方确认,
+完整说明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+
+代码和素材是**分开的**:删掉 `assets/pet/` 桌宠就自动不启动(日志里会记一句),
+其它功能全都正常。
+
 想换成自己的:把逐帧 PNG 放进 `assets/pet/<名字>/`,在 `manifest.json` 里加一行
 `{ "name": ..., "frames": ..., "delay": ... }`,**不用改任何 Rust 代码** ——
 帧表是 `build.rs` 生成的。
@@ -408,7 +416,8 @@ ui/settings.slint  设置窗口(**独立系统窗口**)+ 三张外观预览卡
 ui/icons/*.svg     图标(单色描边,用 colorize 跟着主题变色)
 assets/icon.ico    exe 图标(多尺寸,由 tools/make_icon.py 生成)
 assets/pet/        桌宠动画的逐帧 PNG + manifest.json(帧数/帧间隔)
-                   ⚠️ 素材版权归**鹰角网络**,详见下面「桌宠」一节
+                   ⚠️ 素材版权归**鹰角网络**,不在本项目的 MIT 许可内,
+                   详见 THIRD-PARTY-NOTICES.md
 tools/make_icon.py 生成图标的脚本(改设计改这里重跑,不用找美术)
 tools/pet-assets/  把桌宠素材的 GIF 拆成缩放后的 PNG 帧(换素材时跑一次)
 tools/mock-openai.py 本地假 OpenAI 服务:不花 API 费用就能验流式链路
@@ -532,3 +541,18 @@ http://localhost:9315/mcp
 - `tray-icon` 托盘、`tauri-winrt-notification` 系统通知、`winreg` 开机自启
 - `lunar-lite` 农历换算、`chinese_holiday` 法定节假日与调休(内置 2004–2026,离线)
 - `windows-sys` 单实例互斥体、窗口查找、DWM(无边框窗口的圆角)
+
+## 参与贡献
+
+欢迎 issue 和 PR,但**动手前请先读 [CONTRIBUTING.md](CONTRIBUTING.md)** ——
+这个项目有一些硬性约定(中文注释与提交信息、UI 改动要用 `tools/` 下的脚本验证),
+以及几处设计文档的编号引用规则。不合约定的 PR 会被打回,先看能省很多来回。
+
+## 许可证
+
+**代码**以 [MIT 许可证](LICENSE) 授权,Copyright (c) 2026 Swt242。
+
+⚠️ **桌宠美术素材不在 MIT 范围内** —— 版权归鹰角网络所有。完整说明、以及各依赖和
+截图的授权情况,见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+
+本项目是**非官方**的个人作品,与鹰角网络 / Yostar **没有任何隶属或背书关系**。

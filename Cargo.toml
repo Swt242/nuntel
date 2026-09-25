@@ -2,6 +2,14 @@
 name = "nuntel"
 version = "0.1.0"
 edition = "2024"
+description = "Windows 桌面小挂件:桌宠停在桌面角落,待办清单、Markdown 笔记、AI 对话都从它展开"
+# SPDX 表达式。**只覆盖代码**(src/ / build.rs / ui/ / tools/ 里的脚本),
+# assets/pet/ 下的桌宠美术素材不在此列,详见 THIRD-PARTY-NOTICES.md。
+license = "MIT"
+repository = "https://github.com/Swt242/nuntel"
+readme = "README.md"
+keywords = ["desktop", "todo", "slint", "markdown", "pet"]
+categories = ["gui", "productivity"]
 
 [dependencies]
 chinese_holiday = "2026.0.1"
