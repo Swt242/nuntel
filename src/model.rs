@@ -25,7 +25,7 @@ pub const MISSED_MAX_AGE_DAYS: i64 = 7;
 
 // ── 主题 ──────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeName {
     #[default]
@@ -39,15 +39,17 @@ pub enum ThemeName {
 // 跟 ThemeName(亮暗)是**两个独立维度**,别合并:一共 2×2 种组合都得成立。
 // 存的是不依赖界面的名字,推给 UI 时才换成 Slint 的 Appearance 枚举。
 
-#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AppearanceName {
     Solid,
-    /// 默认给玻璃:这是目前一直在用的观感,老数据文件没有这个字段时
-    /// serde 会填 default,升上来不会突然变样。
-    #[default]
+    /// 玻璃:老数据文件没有这个字段时 serde 会填 default,升上来不会突然变样。
     Glass,
-    /// 工业风:全直角 + 发丝线 + 纸墨中性色 + 信号黄
+    /// 工业风:全直角 + 发丝线 + 纸墨中性色 + 信号黄。
+    ///
+    /// ⚠️ 这是**当前选定的缺省外观**,所以 `#[serde(default)]` 和 `defaults()`
+    /// 都会落到它身上(见 `defaults()` 的注释)。
+    #[default]
     Industrial,
 }
 
@@ -184,6 +186,9 @@ impl Todo {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct DataFile {
+    /// 这个字段收不到有用的东西:`CURRENT_VERSION` 是 2、而 `i32::default()` 是 0,
+    /// 靠 derive 的话第一份数据落盘就写着 `version: 0`。**新数据一律走
+    /// `defaults()`**(它把 version 填对),所以这里只是给 serde 一个占位。
     #[serde(default)]
     pub version: i32,
     #[serde(default)]
@@ -202,6 +207,9 @@ pub struct DataFile {
     /// 桌宠显示边长(逻辑像素)。设置窗口里可调。
     #[serde(default = "default_pet_size")]
     pub pet_size: f32,
+    // ⚠️ 下面 `pet_*` 这几项的缺省值就是 `defaults()` 里那个初始档(见该函数的注释)。
+    // 加字段时记得两边一起改,别只在 defaults() 里加、忘了这里的 serde default ——
+    // 那样「新装」和「老文件缺字段」会拿到不一样的值。
     /// 桌宠动画速度,**每个动画一份**(1.0 = 素材原始速度,越大播得越快)。
     ///
     /// 键是动画名(`idle-1` / `read` / `shop` …,来自 `assets/pet/manifest.json`),
@@ -236,18 +244,18 @@ pub struct DataFile {
     /// 走路速度**倍率**(1 = 基准 220 像素/秒)。和每个动画那根速度滑杆是同一个说法。
     #[serde(default = "default_follow_speed")]
     pub pet_follow_speed: f32,
-    /// **不允许跟随**的动画名。缺省 = 都允许 —— 和 `pet_anim_off` 同一个套路:
-    /// 新素材进来默认就能跟随,不用改存档。
-    #[serde(default)]
+    /// **不允许跟随**的动画名,缺省 = 只放行 `PET_FOLLOW_ALLOW` 那几个
+    /// (那是这张表的补集,见 `PET_FOLLOW_OFF_DEFAULT`)。
+    #[serde(default = "default_follow_off")]
     pub pet_follow_off: std::collections::HashSet<String>,
 }
 
 fn default_follow_delay() -> f32 {
-    10.0
+    PET_FOLLOW_DELAY_DEFAULT
 }
 
 fn default_follow_speed() -> f32 {
-    1.0
+    PET_FOLLOW_SPEED_DEFAULT
 }
 
 fn default_true() -> bool {
@@ -258,12 +266,44 @@ fn default_pet_size() -> f32 {
     PET_SIZE_DEFAULT
 }
 
+fn default_follow_off() -> std::collections::HashSet<String> {
+    PET_FOLLOW_OFF_DEFAULT.iter().map(|s| s.to_string()).collect()
+}
+
+/// **第一份数据长什么样。**
+///
+/// ⚠️ 这个函数定义的是「新装」(或数据文件丢了)时的整份缺省档。**别**在这里写
+/// `todos`:清单必须是空的 —— 这里加一条,每个新用户开机就白捡一条待办。
+///
+/// 它和 `DataFile` 上那一堆 `#[serde(default = ...)]` 是**同一套缺省的两个入口**:
+/// 前者管「整个文件不存在」,后者管「文件在、但缺某个字段」(老版本存上去的)。
+/// **两边必须给同一个值** —— 不然同样的设置,新装和从老版本升上来会长得不一样。
+/// 现在字段级的 default 全部转发到下面那些 `*_DEFAULT` 常量,就是为了只有一个源头。
+pub fn defaults() -> DataFile {
+    DataFile {
+        version: CURRENT_VERSION,
+        todos: Vec::new(),
+        theme: ThemeName::default(),
+        appearance: AppearanceName::Industrial,
+        show_pet: true,
+        pet_size: PET_SIZE_DEFAULT,
+        pet_speeds: std::collections::HashMap::new(),
+        pet_anim_off: std::collections::HashSet::new(),
+        pet_anim_order: Vec::new(),
+        pet_follow: true,
+        pet_follow_delay: PET_FOLLOW_DELAY_DEFAULT,
+        pet_follow_speed: PET_FOLLOW_SPEED_DEFAULT,
+        pet_follow_off: default_follow_off(),
+    }
+}
+
 // ── 桌宠外观参数(设置窗口可调,存盘)────────────────────────────────
 //
-// 默认值就是原来写死的那个 112px;范围卡在下面的上下限里,
-// 读盘时还会 clamp 一次 —— 手改 JSON 改出个 10000,不该让宠物撑满屏幕。
+// 这几个 `*_DEFAULT` 就是**当前选定的缺省档**(见 `defaults()` 的注释)。
+// 范围卡在下面的上下限里,读盘时还会 clamp 一次 —— 手改 JSON 改出个 10000,
+// 不该让宠物撑满屏幕。
 
-pub const PET_SIZE_DEFAULT: f32 = 112.0;
+pub const PET_SIZE_DEFAULT: f32 = 140.5;
 pub const PET_SIZE_MIN: f32 = 64.0;
 pub const PET_SIZE_MAX: f32 = 200.0;
 pub const PET_SPEED_DEFAULT: f32 = 1.0;
@@ -283,6 +323,35 @@ pub fn clamp_pet_speed(v: f32) -> f32 {
 pub const FOLLOW_DELAY_MIN: f32 = 3.0;
 pub const FOLLOW_DELAY_MAX: f32 = 60.0;
 pub const FOLLOW_DELAY_DEFAULT: f32 = 10.0;
+
+/// ⚠️ 下面这两个是**跟随鼠标那一组**的缺省档,和上面那对上下限是两回事 ——
+/// 上面 `FOLLOW_DELAY_DEFAULT` 只用来给 `clamp_follow_delay` 兜底(读到非法值时
+/// 退回哪),这里才是「界面上滑杆一开始停在哪」。改缺省档改这两个。
+pub const PET_FOLLOW_DELAY_DEFAULT: f32 = 9.895161;
+pub const PET_FOLLOW_SPEED_DEFAULT: f32 = 0.5826613;
+
+/// **允许跟随的动画白名单。**
+///
+/// 和 `pet_anim_off` / `pet_follow_off` 平时那套「存关掉的、缺省=允许」**反过来**:
+/// 这里是穷举,不在表里的动画默认**不跟随**(见 `PET_FOLLOW_OFF_DEFAULT`)。
+///
+/// 这么定是因为实际用下来「只有这几个姿势适合走来走去」,而不是「少数几个不适合」。
+/// 代价:加新素材默认不会跟随,想让它跟随就加进这张表。
+///
+/// ⚠️ **运行时真正读的是 `PET_FOLLOW_OFF_DEFAULT`(它的补集),不是这张表** ——
+/// 这张表是「意图」的单一出处,靠单测核对两边互补。所以非测试构建下它是 dead_code,
+/// 那是预期内的,别顺手删掉(删了「哪些该跟随」就没地方声明了)。
+#[cfg_attr(not(test), allow(dead_code))]
+pub const PET_FOLLOW_ALLOW: &[&str] = &["idle-3", "idle-5", "idle-7"];
+
+/// 缺省**不允许**跟随的动画 —— 就是上面那张表的补集。
+///
+/// ⚠️ **故意把补集也写死一份**:`ANIMATIONS` 是运行时才有的切片,const 期推不出补集来。
+/// 所以两处必须一起改 —— 单测 `default_follow_off_is_exactly_the_complement_of_the_allow_list`
+/// 会核对它们确实是互补的,加了素材忘了改就会红。
+pub const PET_FOLLOW_OFF_DEFAULT: &[&str] = &[
+    "idle-1", "idle-2", "idle-4", "idle-6", "idle-8", "read", "shop",
+];
 
 pub fn clamp_follow_delay(v: f32) -> f32 {
     if v.is_finite() { v.clamp(FOLLOW_DELAY_MIN, FOLLOW_DELAY_MAX) } else { FOLLOW_DELAY_DEFAULT }
@@ -457,13 +526,13 @@ fn rename_log_inside(new_dir: &Path, old_name: &str) {
 /// 顺带做一次 v1 → v2 的备份:老文件在写回之前先留一份 `todos.json.v1.bak`。
 pub fn load(path: &Path) -> DataFile {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return DataFile::default(); // 第一次运行还没这个文件
+        return defaults(); // 第一次运行还没这个文件
     };
     let data: DataFile = match serde_json::from_str(&text) {
         Ok(data) => data,
         Err(err) => {
             crate::platform::log(&format!("{} 内容无法解析,先当空清单处理: {err}", path.display()));
-            return DataFile::default();
+            return defaults();
         }
     };
 
@@ -586,6 +655,57 @@ mod tests {
         };
         assert!(due.is_all_day());
         assert_eq!(due.remind_at(15).unwrap(), at(2026, 9, 19, 9, 0));
+    }
+
+    #[test]
+    fn new_install_and_missing_field_agree_on_defaults() {
+        // 两条入口:整个文件不存在(走 defaults()),和文件在但缺字段(走 serde default)。
+        // 它们必须给同一套值,否则同样的设置「新装」和「从老版本升上来」会长得不一样。
+        let from_serde: DataFile = serde_json::from_str("{}").unwrap();
+        let fresh = defaults();
+
+        assert_eq!(from_serde.appearance, fresh.appearance);
+        assert_eq!(from_serde.show_pet, fresh.show_pet);
+        assert_eq!(from_serde.pet_size, fresh.pet_size);
+        assert_eq!(from_serde.pet_follow, fresh.pet_follow);
+        assert_eq!(from_serde.pet_follow_delay, fresh.pet_follow_delay);
+        assert_eq!(from_serde.pet_follow_speed, fresh.pet_follow_speed);
+        assert_eq!(from_serde.pet_follow_off, fresh.pet_follow_off);
+        assert_eq!(from_serde.pet_anim_off, fresh.pet_anim_off);
+        assert_eq!(from_serde.pet_anim_order, fresh.pet_anim_order);
+        assert_eq!(from_serde.pet_speeds, fresh.pet_speeds);
+        assert_eq!(from_serde.theme, fresh.theme);
+    }
+
+    #[test]
+    fn default_follow_off_is_exactly_the_complement_of_the_allow_list() {
+        // 允许表里的名字必须真的存在(改名或删素材时会在这里炸出来)
+        for name in PET_FOLLOW_ALLOW {
+            assert!(
+                crate::pet::ANIMATIONS.iter().any(|a| a.name == *name),
+                "PET_FOLLOW_ALLOW 里的 {name} 在素材清单里不存在"
+            );
+        }
+        // THE constraint:follow_off 必须正好是允许表的补集。
+        // 少一个 = 那个动画默认会跟随,多一个 = 它被允许却又不跟随。
+        let off = default_follow_off();
+        let expected: std::collections::HashSet<String> = crate::pet::ANIMATIONS
+            .iter()
+            .map(|a| a.name)
+            .filter(|n| !PET_FOLLOW_ALLOW.contains(n))
+            .map(String::from)
+            .collect();
+        assert_eq!(off, expected, "follow_off 和 PET_FOLLOW_ALLOW 对不上");
+        // 顺带把「所有动画恰好分成两堆」这个性质测掉
+        assert_eq!(off.len() + PET_FOLLOW_ALLOW.len(), crate::pet::ANIMATIONS.len());
+    }
+
+    #[test]
+    fn fresh_install_has_current_version_and_no_todos() {
+        let fresh = defaults();
+        assert_eq!(fresh.version, CURRENT_VERSION);
+        // 缺省档里绝不能带待办,否则每个新用户开机就白捡一条
+        assert!(fresh.todos.is_empty());
     }
 
     #[test]

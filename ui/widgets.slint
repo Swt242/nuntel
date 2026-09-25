@@ -555,11 +555,16 @@ export global AppData {
     /// 当前这一帧的图。动图由宿主逐帧推 —— Slint 的 Image 是静态的,不会自己播。
     in property <image> pet-frame;
     /// 宠物显示边长(px)。范围见 Rust 侧的 PET_SIZE_MIN/MAX
-    in property <float> pet-size: 112;
+    ///
+    /// ⚠️ 下面这几个 `pet-*` 的数字只是**声明初值** —— 启动时宿主会把
+    /// `model::defaults()` 那套推过来覆盖掉。**改默认值要改 Rust 侧**
+    /// (`model.rs` 的 `*_DEFAULT` 常量),这里跟着同步一份只是为了别让
+    /// 两处数字对不上、被后来的人当成默认值。
+    in property <float> pet-size: 140.5;
     /// 跟随鼠标总开关 + 静止多久出发(秒)+ 走路速度倍率(§40)
     in property <bool> pet-follow: true;
-    in property <float> pet-follow-delay: 10;
-    in property <float> pet-follow-speed: 1.0;
+    in property <float> pet-follow-delay: 9.895161;
+    in property <float> pet-follow-speed: 0.5826613;
     /// 所有动画,每个带自己的速度倍率(设置窗口里一行一个滑杆)
     in property <[PetAnim]> pet-anims;
     /// 设置窗口里正在「试演」的那一个动画名(空 = 没在试)。
